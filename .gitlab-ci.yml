@@ -55,23 +55,6 @@ test:
     - if: '$CI_COMMIT_REF_NAME =~ /build/'
     - if: '$CI_PIPELINE_SOURCE == "web"'
 
-# Builds específicos para cada componente
-container-image-asterisk:
-  extends: .build_template
-  stage: build
-  variables:
-    IMAGE_NAME: "dialer_asterisk"
-    DOCKERFILE_PATH: "asterisk/Dockerfile"
-    BUILD_CONTEXT: "asterisk"
-
-container-image-dialplan:
-  extends: .build_template
-  stage: build
-  variables:
-    IMAGE_NAME: "dialer_dialplan"
-    DOCKERFILE_PATH: "dialplan/Dockerfile"
-    BUILD_CONTEXT: "dialplan"
-
 container-image-api:
   extends: .build_template
   stage: build
@@ -87,11 +70,3 @@ container-image-worker:
     IMAGE_NAME: "dialer_worker"
     DOCKERFILE_PATH: "workers/handle-campaign/src/Dockerfile"
     BUILD_CONTEXT: "workers/handle-campaign/src"
-
-container-image-websocket_ari:
-  extends: .build_template
-  stage: build
-  variables:
-    IMAGE_NAME: "dialer_listener"
-    DOCKERFILE_PATH: "websocket_ari/src/Dockerfile"
-    BUILD_CONTEXT: "websocket_ari/src"

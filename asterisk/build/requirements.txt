@@ -1,4 +1,0 @@
-websocket-client==1.6.1
-requests==2.27.1
-SoundFile==0.12.1
-pytz==2024.1

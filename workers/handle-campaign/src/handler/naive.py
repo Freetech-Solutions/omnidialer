@@ -6,7 +6,6 @@ import atexit
 import signal
 import threading
 
-from .ari_manager import ARI
 from .utils import timed_lru_cache
 
 import re
@@ -40,6 +39,14 @@ from settings.default import (REDIS_DIALER_PORT, REDIS_DIALER_SERVER, GEARMAN_JO
 import logging
 
 from ui.rendering import AdminRender
+# --- logging primero (ANTES de atexit/signal) ---
+LOGLEVEL = os.environ.get('PYTHON_LOGLEVEL', 'INFO').upper()
+logging.basicConfig(
+    level=LOGLEVEL,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # Flag global para registrar listener una sola vez
 _SCHED_LISTENER_REGISTERED = False
 # Flag global para shutdown ordenado
@@ -47,21 +54,43 @@ _SCHED_SHUTDOWN_DONE = False
 
 
 def _shutdown_scheduler_gracefully():
-    """Cierra el scheduler sin bloquear para evitar warnings al terminar el proceso."""
+    """
+    Cierra el scheduler sin bloquear para evitar warnings al terminar el proceso.
+
+    - Evita NameError si SchedulerWorker todavía no existe (signal temprano durante import).
+    """
     global _SCHED_SHUTDOWN_DONE
     if _SCHED_SHUTDOWN_DONE:
         return
     _SCHED_SHUTDOWN_DONE = True
+
     try:
-        SchedulerWorker.SCHEDULER.shutdown(wait=False)
-        logger.info("Scheduler shutdown solicitado (wait=False)")
+        sw = globals().get("SchedulerWorker")  # puede no existir aún
+        sched = getattr(sw, "SCHEDULER", None) if sw else None
+        if sched is None:
+            logger.debug("Scheduler shutdown: SchedulerWorker/SCHEDULER no disponible aún.")
+            return
+
+        # Verificar si el scheduler está corriendo antes de hacer shutdown
+        if sched.running:
+            sched.shutdown(wait=False)
+            logger.info("Scheduler shutdown solicitado (wait=False)")
+        else:
+            logger.debug("Scheduler shutdown: scheduler no está corriendo, omitiendo shutdown.")
     except Exception as e:
-        logger.debug("Scheduler shutdown: %s", e)
+        logger.debug("Scheduler shutdown: %s", e, exc_info=True)
 
 
 def _sched_sig_handler(signum, frame):
-    # Ejecutar en hilo para no interferir con el handler del intérprete
-    threading.Thread(target=_shutdown_scheduler_gracefully, daemon=True).start()
+    """Ejecuta shutdown en un hilo daemon para no bloquear el signal handler."""
+    try:
+        threading.Thread(target=_shutdown_scheduler_gracefully, daemon=True).start()
+    except Exception:
+        # último recurso: evitar que un error aquí tumbe el proceso
+        try:
+            logger.debug("SIG handler: no se pudo iniciar hilo para shutdown.", exc_info=True)
+        except Exception:
+            pass
 
 
 # Registrar hooks de salida (hazlo una sola vez por módulo)
@@ -69,27 +98,14 @@ atexit.register(_shutdown_scheduler_gracefully)
 signal.signal(signal.SIGTERM, _sched_sig_handler)
 signal.signal(signal.SIGINT, _sched_sig_handler)
 
-LOGLEVEL = os.environ.get('PYTHON_LOGLEVEL', 'INFO').upper()
 
-logger = logging.getLogger(__name__)
-
-logging.basicConfig(level=LOGLEVEL, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-ASTERISK_USER = os.getenv('ASTERISK_USER', 'omnileadsami')
-
-ASTERISK_PASS = os.getenv('ASTERISK_PASS', '5_MeO_DMT')
-
-ASTERISK_HOST = os.getenv('ASTERISK_HOST', 'dialer_acd')
-
-ASTERISK_PORT = os.getenv('ASTERISK_PORT', '8888')
-
-ASTERISK_APP = os.getenv('ASTERISK_APP', 'call_manager')
-
-ARI_BASE_URL = f'http://{ASTERISK_HOST}:{ASTERISK_PORT}/ari'
+WEBRTC_TRUNK = os.getenv('WEBRTC_TRUNK', 'webrtc-trunk')
 
 REDIS_OML_SERVER = os.getenv('REDIS_OML_SERVER', 'oml-redis')
 
 REDIS_OML_PORT = os.getenv('REDIS_OML_PORT', '6379')
+
+REDIS_DIALER_DB = int(os.getenv('REDIS_DIALER_DB', 3))
 
 POSTGRES_OML_SERVER = os.getenv('POSTGRES_OML_SERVER', 'oml-postgres')
 
@@ -112,6 +128,8 @@ POSTGRES_DIALER_DB = os.getenv('POSTGRES_DIALER_DB', 'omnidialer')
 POSTGRES_DIALER_PASSWORD = os.getenv('POSTGRES_DIALER_PASSWORD')
 
 DIALER_ACD_HOST = os.getenv('DIALER_ACD_HOST', 'omlacd')
+
+DIALER_DIALPLAN_CONTEXT = os.getenv('DIALER_DIALPLAN_CONTEXT', 'oml-dial-dialer')
 
 SCHEDULER_API_HOST = os.getenv('SCHEDULER_API_HOST', 'scheduler-api')
 
@@ -151,9 +169,12 @@ STATUS_CONGESTION = 4
 STATUS_TERMINATED = 2
 STATUS_TIMEOUT = 5
 STATUS_CHANUNAVAIL = 8
+STATUS_INVALID_NUMBER = 9
+STATUS_AMD_MACHINE = 10  # AMD declaró MACHINE (contestador); entidad propia para métricas
 
 NAME_TO_STATUS = {
     "CHANUNAVAIL": STATUS_CHANUNAVAIL,
+    "INVALID_NUMBER": STATUS_INVALID_NUMBER,
     "BUSY": STATUS_BUSY,
     "NOANSWER": STATUS_NOANSWER,
     "CONGESTION": STATUS_CONGESTION,
@@ -161,6 +182,22 @@ NAME_TO_STATUS = {
     "ANSWERED_AGENT": STATUS_ANSWERED_AGENT,
     "TERMINATED": STATUS_TERMINATED,
     "TIMEOUT": STATUS_TIMEOUT,
+    "CANCEL": STATUS_TERMINATED,  # llamada cancelada antes de contestar; sin reglas de incidencia
+    "AMD": STATUS_AMD_MACHINE,  # contestador detectado; entidad propia en history y métricas
+}
+
+# mapeo código -> nombre para interpretar history y métricas
+STATUS_TO_NAME = {
+    STATUS_BUSY: "BUSY",
+    STATUS_TERMINATED: "TERMINATED",
+    STATUS_NOANSWER: "NOANSWER",
+    STATUS_CONGESTION: "CONGESTION",
+    STATUS_TIMEOUT: "TIMEOUT",
+    STATUS_ANSWERED_AGENT: "ANSWERED_AGENT",
+    STATUS_ANSWERED_PSTN: "ANSWERED_PSTN",
+    STATUS_CHANUNAVAIL: "CHANUNAVAIL",
+    STATUS_INVALID_NUMBER: "INVALID_NUMBER",
+    STATUS_AMD_MACHINE: "AMD",  # AMD Detected / Contestador
 }
 
 # contact final status
@@ -188,10 +225,10 @@ DISPOSITION_TYPE = 2
 
 # fail statuses
 # TODO: incorporate the names of the other fail events
-FAIL_EVENTS = ['BUSY', 'NOANSWER', 'CONGESTION', 'TIMEOUT', 'TERMINATED']
+FAIL_EVENTS = ['BUSY', 'NOANSWER', 'CONGESTION', 'TIMEOUT', 'TERMINATED', 'CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'AMD']
 
 # fail statuses with no incidence rules
-FAIL_NO_RULES_EVENTS = ['CHANUNAVAIL']
+FAIL_NO_RULES_EVENTS = ['CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'AMD']
 
 # incidence rules multinum behauviour
 FIXED = 1
@@ -233,12 +270,93 @@ class AverageWorker(DialerWorker):
     GM_CLIENT = gearman.GearmanClient(GEARMAN_JOB_SERVERS)
     ACTIVE_CAMPAIGNS_SET = 'campaigns:active'
 
-    ari = ARI(
-        user=ASTERISK_USER,
-        password=ASTERISK_PASS,
-        host=ASTERISK_HOST,
-        port=int(ASTERISK_PORT)
-    )
+    @classmethod
+    def _get_gearman_client(cls):
+        """
+        Helper para obtener el cliente Gearman.
+        Retorna el cliente existente o crea uno nuevo si es necesario.
+        
+        Returns:
+            gearman.GearmanClient: Cliente Gearman configurado
+        """
+        if cls.GM_CLIENT is None:
+            cls.GM_CLIENT = gearman.GearmanClient(GEARMAN_JOB_SERVERS)
+        return cls.GM_CLIENT
+
+    @classmethod
+    def trigger_acd_dial(cls, phone_number, campaign_id, contact_id, agent_id=None, attributes=None):
+        """
+        Envía un job a Gearman para ejecutar una llamada a través del ACD.
+        
+        Args:
+            phone_number (str): Número de teléfono a llamar
+            campaign_id (int): ID de la campaña
+            contact_id (int): ID del contacto
+            agent_id (int, optional): ID del agente (si aplica)
+            attributes (dict, optional): Metadatos adicionales
+            
+        Returns:
+            bool: True si el job se envió correctamente, False en caso de error
+        """
+        try:
+            # Construir payload JSON
+            payload = {
+                "command": "dial",
+                "number": phone_number,
+                "campaign_id": campaign_id,
+                "contact_id": contact_id,
+                "agent_id": agent_id,
+                "metadata": attributes or {}
+            }
+            
+            message = json.dumps(payload)
+            
+            # Obtener cliente Gearman
+            client = cls._get_gearman_client()
+            
+            # Enviar job a Gearman con background=True
+            client.submit_job('acd-call-processor', message, background=True)
+            
+            logger.info(
+                f"Job enviado a acd-call-processor para contact {contact_id} "
+                f"en campaign {campaign_id}, número: {phone_number}"
+            )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(
+                f"Error al enviar job a acd-call-processor para contact {contact_id} "
+                f"en campaign {campaign_id}: {e}",
+                exc_info=True
+            )
+            return False
+
+    # Housekeeping del set de idempotencia (SEEN)
+    SEEN_TTL_SECONDS = int(os.getenv("SCHED_SEEN_TTL_SECONDS", 7 * 24 * 3600))  # 7 días
+
+    # Lua: decrementa H[AGENDAS] sólo si > 0, y devuelve el nuevo valor
+    _LUA_HINCR_IF_GT0 = """
+    local key = KEYS[1]
+    local field = ARGV[1]
+    local delta = tonumber(ARGV[2])
+
+    local cur = redis.call('HGET', key, field)
+    if not cur then
+        cur = 0
+    else
+        cur = tonumber(cur) or 0
+    end
+
+    if cur <= 0 then
+        return cur
+    end
+
+    local newv = cur + delta
+    if newv < 0 then newv = 0 end
+    redis.call('HSET', key, field, newv)
+    return newv
+    """
 
     @classmethod
     def get_oml_connection(cls):
@@ -298,28 +416,32 @@ class AverageWorker(DialerWorker):
     @classmethod
     def agendas_increment(cls, id_campaign, delta=1):
         cls.connect_redis_dialer()
-        key = cls._agendas_counter_key(id_campaign)
-        cls.REDIS_DIALER_CONNECTION.hincrby(key, 'AGENDAS', delta)
+        key = cls._agendas_counter_key(int(id_campaign))
+        try:
+            cls.REDIS_DIALER_CONNECTION.hincrby(key, 'AGENDAS', int(delta))
+        except Exception:
+            logger.exception("agendas_increment failed camp=%s delta=%s", id_campaign, delta)
 
     @classmethod
-    def agendas_decrement_safe(cls, id_campaign, job_id):
+    def agendas_decrement(cls, id_campaign, delta=1):
         """
-        Decremento idempotente: si ya vimos este job_id, no decrementamos
+        Decrementa AGENDAS de forma atómica y nunca negativa (sin idempotencia).
+        Útil como fallback si algo llama agendas_decrement() directamente.
         """
         cls.connect_redis_dialer()
-        seen_key = cls._agendas_seen_set_key(id_campaign)
-        if cls.REDIS_DIALER_CONNECTION.sadd(seen_key, job_id):
-            key = cls._agendas_counter_key(id_campaign)
-            # Evita ir a negativo
-            pipe = cls.REDIS_DIALER_CONNECTION.pipeline()
-            pipe.hget(key, 'AGENDAS')
-            current = pipe.execute()[0]
-            try:
-                cur = int(current or 0)
-            except (TypeError, ValueError):
-                cur = 0
-            if cur > 0:
-                cls.REDIS_DIALER_CONNECTION.hincrby(key, 'AGENDAS', -1)
+        key = cls._agendas_counter_key(int(id_campaign))
+
+        try:
+            dec = -abs(int(delta or 1))
+            cls.REDIS_DIALER_CONNECTION.eval(
+                cls._LUA_HINCR_IF_GT0,
+                1,          # numkeys
+                key,        # KEYS[1]
+                "AGENDAS",  # ARGV[1]
+                dec         # ARGV[2]
+            )
+        except Exception:
+            logger.exception("agendas_decrement failed camp=%s delta=%s", id_campaign, delta)
 
     @classmethod
     def rebuild_active_campaigns_set(cls):
@@ -522,9 +644,24 @@ class AverageWorker(DialerWorker):
                 contacts_attempts_number_prev = cls.allowed_parallel_contact_attempts(id_campaign)
                 contacts_attempts_number = cls.allowed_calls_prority_percentage(
                     id_campaign, contacts_attempts_number_prev)
+                
+                # Conectar Redis antes del loop para reservas atómicas
+                cls.connect_redis_dialer()
+                key_calls = f'OML:CALLS:{id_campaign}:DIALER'
+                campaign_max = cls.get_campaign_max_available_channels(id_campaign)
+                active_channels = cls.get_active_channels(id_campaign)
+                
+                # Log de información de canales en el ciclo
+                logger.debug(
+                    f'Campaign {id_campaign}: ciclo actual - '
+                    f'canales_maximos={campaign_max} llamadas_actuales={active_channels} '
+                    f'contactos_permitidos={contacts_attempts_number}'
+                )
+                
                 initial_time = datetime.datetime.now()
                 caps_calls_counter = 0
                 contacts = cls.take_contacts(contacts_attempts_number, id_campaign)
+                
                 if TIME_BETWEEN_CALLS:
                     if not contacts:
                         sleep(float(TIME_BETWEEN_CALLS))
@@ -541,6 +678,28 @@ class AverageWorker(DialerWorker):
                             if caps_calls_counter < CAPS:
                                 logger.debug(
                                     f"Campaign {id_campaign}: attempt to call selected contact")
+                                
+                                # --- RESERVA INMEDIATA EN EL LOOP ---
+                                # Incrementamos ANTES de mandar a Gearman para evitar el lag
+                                current = cls.REDIS_DIALER_CONNECTION.incrby(key_calls, 1)
+                                
+                                # Verificación de seguridad (Double Check)
+                                if current > campaign_max:
+                                    # Si nos pasamos, devolvemos el cupo y abortamos este contacto
+                                    cls.REDIS_DIALER_CONNECTION.decrby(key_calls, 1)
+                                    logger.warning(
+                                        f"Campaign {id_campaign}: Exceeded max channels "
+                                        f"({current} > {campaign_max}). Skipping contact {contact[0]}"
+                                    )
+                                    # Lo marcamos para reintento
+                                    with cls.get_dialer_connection() as conn:
+                                        conn.cursor().execute(
+                                            'UPDATE contact_in_campaign SET status = %s WHERE id_contact = %s AND id_campaign = %s',
+                                            (STATUS_CREATED, contact[0], id_campaign)
+                                        )
+                                    break
+                                
+                                # Si la reserva fue exitosa, enviamos a Gearman
                                 cls.attempt_contact(contact, id_campaign)
                                 caps_calls_counter += 1
                                 break
@@ -601,7 +760,11 @@ class AverageWorker(DialerWorker):
     def connect_redis_dialer(cls):
         if cls.REDIS_DIALER_CONNECTION is None:
             cls.REDIS_DIALER_CONNECTION = redis.Redis(
-                host=REDIS_DIALER_SERVER, port=int(REDIS_DIALER_PORT), decode_responses=True, db=3)
+                host=REDIS_DIALER_SERVER,
+                port=int(REDIS_DIALER_PORT),
+                decode_responses=True,
+                db=REDIS_DIALER_DB,
+            )
 
     @classmethod
     def is_allowed_to_call(cls, id_campaign):
@@ -614,49 +777,120 @@ class AverageWorker(DialerWorker):
 
     @classmethod
     def get_campaign_data(cls, id_campaign, cursor_oml, contact_strategy):
-        # import campaign configuration from tables of OML
-        logger.debug(f'Retrieving data from OML campaign with id={id_campaign}')
-        logger.debug(f'Campaign {id_campaign}: from ominicontacto_app_campana')
-        cursor_oml.execute(
-            'SELECT id,estado,nombre,fecha_inicio,fecha_fin,control_de_duplicados,prioridad '
-            ' FROM ominicontacto_app_campana WHERE id = %s;', (id_campaign,))
-        campaign_id_data = cursor_oml.fetchone()
-        logger.debug(f'Campaign {id_campaign}: from queue_table')
-        cursor_oml.execute(
-            'SELECT strategy,wait,initial_predictive_model,initial_boost_factor,maxlen '
-            ' FROM queue_table WHERE campana_id = %s;', (id_campaign,))
-        campaign_id_data += cursor_oml.fetchone()
-        logger.debug(f'Campaign {id_campaign}: from ominicontacto_app_actuacionvigente')
-        cursor_oml.execute('SELECT domingo,lunes,martes,miercoles,jueves,viernes,sabado,hora_desde,'
-                           'hora_hasta FROM ominicontacto_app_actuacionvigente'
-                           ' WHERE campana_id = %s;', (id_campaign,))
-        campaign_id_data += cursor_oml.fetchone()
-        logger.debug(f'Campaign {id_campaign}: setting dialer specific options')
+        """
+        Obtiene los datos de la campaña desde OML con retry automático y refresco de transacción.
+        """
+        logger.debug(f"Retrieving data from OML campaign with id={id_campaign}")
+
+        # Definimos la función helper DENTRO del método (sin @classmethod)
+        def execute_with_retry(query, params, context, max_retries=10, initial_delay=0.5):
+            """Ejecuta una consulta con retry y REFRESCANDO la conexión."""
+            for attempt in range(max_retries):
+                # --- AQUÍ ESTÁ LA CLAVE DEL ARREGLO ---
+                # Si fallamos la primera vez, hacemos commit en la conexión de LECTURA
+                # para forzar a Postgres a refrescar el snapshot y ver datos nuevos.
+                if attempt > 0:
+                    try:
+                        cursor_oml.connection.commit()
+                    except Exception as e:
+                        logger.warning(f"Error refreshing connection snapshot: {e}")
+                # --------------------------------------
+
+                cursor_oml.execute(query, params)
+                row = cursor_oml.fetchone()
+
+                if row is not None:
+                    if attempt > 0:
+                        logger.debug(
+                            f"Campaign {id_campaign}: Successfully retrieved {context} "
+                            f"on attempt {attempt + 1}"
+                        )
+                    return row
+
+                if attempt < max_retries - 1:
+                    # Usamos min() para que la espera no sea eterna (tope 3 seg)
+                    delay = min(initial_delay * (2 ** attempt), 3.0)
+                    logger.warning(
+                        f"Campaign {id_campaign}: No row returned for {context} "
+                        f"on attempt {attempt + 1}/{max_retries}. "
+                        f"Retrying in {delay:.2f}s..."
+                    )
+                    sleep(delay)
+                else:
+                    raise ValueError(
+                        f"Campaign {id_campaign}: no row returned for {context} "
+                        f"after {max_retries} attempts"
+                    )
+
+        # 1. ominicontacto_app_campana
+        logger.debug(f"Campaign {id_campaign}: from ominicontacto_app_campana")
+        campaign_id_data = execute_with_retry(
+            "SELECT id,estado,nombre,fecha_inicio,fecha_fin,control_de_duplicados,prioridad "
+            "FROM ominicontacto_app_campana WHERE id = %s;",
+            (id_campaign,),
+            "ominicontacto_app_campana"
+        )
+
+        # 2. queue_table
+        logger.debug(f"Campaign {id_campaign}: from queue_table")
+        campaign_id_data += execute_with_retry(
+            "SELECT strategy,wait,initial_predictive_model,initial_boost_factor,maxlen "
+            "FROM queue_table WHERE campana_id = %s;",
+            (id_campaign,),
+            "queue_table"
+        )
+
+        # 3. ominicontacto_app_actuacionvigente
+        logger.debug(f"Campaign {id_campaign}: from ominicontacto_app_actuacionvigente")
+        campaign_id_data += execute_with_retry(
+            "SELECT domingo,lunes,martes,miercoles,jueves,viernes,sabado,hora_desde,hora_hasta "
+            "FROM ominicontacto_app_actuacionvigente WHERE campana_id = %s;",
+            (id_campaign,),
+            "ominicontacto_app_actuacionvigente"
+        )
+
+        logger.debug(f"Campaign {id_campaign}: setting dialer specific options")
         campaign_id_data += (contact_strategy, CREATED)
-        logger.debug(f'Campaign {id_campaign}: from incidence rules')
+
+        # Las reglas de incidencia usualmente se crean en la misma transacción.
+        # Si fallan, el retry debería aplicarse también, pero por ahora
+        # mantenemos tu estructura original asumiendo que si la campaña apareció,
+        # las reglas también.
+        logger.debug(f"Campaign {id_campaign}: from incidence rules")
         cursor_oml.execute(
-            'SELECT * FROM ominicontacto_app_reglasincidencia WHERE campana_id = %s;',
-            (id_campaign,))
+            "SELECT * FROM ominicontacto_app_reglasincidencia WHERE campana_id = %s;",
+            (id_campaign,)
+        )
         incidence_rules_data = cursor_oml.fetchall()
-        logger.debug(f'Campaign {id_campaign}: from incidence rules for disposition options')
+
+        logger.debug(f"Campaign {id_campaign}: from incidence rules for disposition options")
         cursor_oml.execute(
             """SELECT ric.id,ric.opcion_calificacion_id,ric.intento_max,ric.reintentar_tarde,
             ric.en_modo,opc.campana_id
             FROM ominicontacto_app_reglaincidenciaporcalificacion AS ric
             INNER JOIN ominicontacto_app_opcioncalificacion AS opc ON
             ric.opcion_calificacion_id = opc.id
-            AND opc.campana_id = %s;""", (id_campaign,))
+            AND opc.campana_id = %s;""", (id_campaign,)
+        )
         incidence_rules_disposition_data = cursor_oml.fetchall()
-        cursor_oml.execute(
+
+        # 4. Metadata (También aplicamos retry aquí por seguridad)
+        metadata_row = execute_with_retry(
             """SELECT db.metadata FROM ominicontacto_app_basedatoscontacto as db
             INNER JOIN ominicontacto_app_campana AS ca ON ca.bd_contacto_id = db.id
-            AND ca.id = %s;""", (id_campaign,))
-        metadata = json.dumps(cursor_oml.fetchone()[0])
+            AND ca.id = %s;""",
+            (id_campaign,),
+            "basedatoscontacto.metadata join (bd_contacto_id)"
+        )
+        metadata = json.dumps(metadata_row[0])
         campaign_id_data += (metadata,)
+
         cls.connect_redis_oml()
         customdialerdst = cls.REDIS_OML_CONNECTION.hget(
-            f'OML:CAMP:{id_campaign}', 'CUSTOMDIALERDST')
+            f"OML:CAMP:{id_campaign}", "CUSTOMDIALERDST"
+        )
         campaign_id_data += (customdialerdst,)
+
         return campaign_id_data, incidence_rules_data, incidence_rules_disposition_data
 
     @classmethod
@@ -686,6 +920,10 @@ class AverageWorker(DialerWorker):
                     customdialerdst = campaign_id_data[-1]
                     cls.REDIS_DIALER_CONNECTION.set(
                         f'CAMP:{id_campaign}:CUSTOMDIALERDST', customdialerdst)
+                    voicebot = cls.REDIS_OML_CONNECTION.hget(
+                        f"OML:CAMP:{id_campaign}", "VOICEBOT")
+                    cls.REDIS_DIALER_CONNECTION.set(
+                        f'CAMP:{id_campaign}:VOICEBOT', voicebot or 'False')
                     params = campaign_id_data[1:] + (id_campaign,)
                     cursor_dialer.execute(
                         """UPDATE campaign SET oml_status = %s, name = %s, start_date = %s,
@@ -776,7 +1014,17 @@ class AverageWorker(DialerWorker):
         id_campaign = data['id_campaign']
         logger.debug(f'Creating the campaign {id_campaign}')
         contact_strategy = data['contact_strategy']
-        prefix = data['prefix']
+        prefix = data.get('prefix')
+        
+        # Normalizar prefix: convertir lista vacía a None, o lista a string
+        if prefix == []:
+            prefix = None
+        elif isinstance(prefix, list) and len(prefix) > 0:
+            prefix = str(prefix[0])
+        elif prefix is not None:
+            prefix = str(prefix)
+        # Si prefix es None, se mantiene como None (aceptado por PostgreSQL)
+        
         cls.connect_redis_dialer()
         cls.connect_redis_oml()
         with cls.get_dialer_connection() as conn_dialer:
@@ -785,12 +1033,16 @@ class AverageWorker(DialerWorker):
                 with cls.get_oml_connection() as conn_oml:
                     cursor_oml = conn_oml.cursor()
                     (campaign_id_data, incidence_rules_data,
-                     incidence_rules_disposition_data) = cls.get_campaign_data(
+                    incidence_rules_disposition_data) = cls.get_campaign_data(
                         id_campaign, cursor_oml, contact_strategy)
                     cls.connect_redis_dialer()
                     customdialerdst = campaign_id_data[-1]
                     cls.REDIS_DIALER_CONNECTION.set(
                         f'CAMP:{id_campaign}:CUSTOMDIALERDST', customdialerdst)
+                    voicebot = cls.REDIS_OML_CONNECTION.hget(
+                        f"OML:CAMP:{id_campaign}", "VOICEBOT")
+                    cls.REDIS_DIALER_CONNECTION.set(
+                        f'CAMP:{id_campaign}:VOICEBOT', voicebot or 'False')
                     logger.debug(
                         f'Campaign {id_campaign}: inserting the campaign data into omnidialer')
                     campaign_id_data = campaign_id_data + (prefix,)
@@ -801,7 +1053,7 @@ class AverageWorker(DialerWorker):
                         initial_boost_factor, max_channels, sunday, monday, tuesday, wednesday,
                         thursday, friday, saturday, hour_start, hour_ends, contact_strategy,
                         dialer_status, metadata, customdialerdst, prefix) VALUES
-                         (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s, %s);""", campaign_id_data)
                     logger.debug(
                         f'Campaign {id_campaign}: inserting the incidence_rules into omnidialer')
@@ -811,7 +1063,7 @@ class AverageWorker(DialerWorker):
                             (id, status, status_custom, max_attempt, retry_later, in_mode,
                             campaign_id) VALUES (%s, %s, %s, %s, %s, %s, %s);""", incidence_rule)
                     logger.debug(f'Campaign {id_campaign}: Inserting the incidence_rules for'
-                                 ' disposition option into omnidialer')
+                                ' disposition option into omnidialer')
                     for incidence_rule in incidence_rules_disposition_data:
                         cursor_dialer.execute(
                             """INSERT INTO incidence_rules_disposition
@@ -827,8 +1079,8 @@ class AverageWorker(DialerWorker):
                                     'camp_id': id_campaign}))
                     cls.REDIS_OML_CONNECTION.publish(
                         'OML:CHANNEL:DIALER', json.dumps({'type': 'CALLS',
-                                                          'camp_id': id_campaign,
-                                                          'calls': 0}))
+                                                        'camp_id': id_campaign,
+                                                        'calls': 0}))
 
         cls.update_percentages_priority_campaigns()
 
@@ -1244,13 +1496,13 @@ class AverageWorker(DialerWorker):
         """
         Calculates how many NEW calls this campaign can originate in the current cycle.
 
-        - In "predictive" mode (CUSTOMDIALERDST == '0'):
+        - In "predictive" mode (CUSTOMDIALERDST == '0' and VOICEBOT not True):
             Desired Target = available_agents_score * boost_factor
             New calls = Target - active_channels, limited by:
                 * Campaign's max_channels
                 * Actual available channels (num_available_channels)
 
-        - In "power dialer" mode (CUSTOMDIALERDST != '0'):
+        - In "power dialer" mode (CUSTOMDIALERDST != '0' or CAMP:{id}:VOICEBOT=True):
             Simply fills up to max_channels, respecting the available free channels.
         """
         # 1) campaign status
@@ -1267,14 +1519,20 @@ class AverageWorker(DialerWorker):
             id_campaign, active_channels, campaign_max_available_channels, num_available_channels
         )
 
-        # 2) POWER DIALER mode (customdest different from '0'):
+        # 2) POWER DIALER mode (customdest different from '0' or VOICEBOT=True):
         #    here the idea is simply to fill channels up to the maximum.
         customdialerdst = cls.REDIS_DIALER_CONNECTION.get(f'CAMP:{id_campaign}:CUSTOMDIALERDST')
-        if customdialerdst is not None and customdialerdst != '0':
+        voicebot = cls.REDIS_DIALER_CONNECTION.get(f'CAMP:{id_campaign}:VOICEBOT')
+        is_power_dialer = (
+            (customdialerdst is not None and customdialerdst != '0')
+            or (voicebot and str(voicebot).lower() == 'true')
+        )
+        if is_power_dialer:
+            reason = 'VOICEBOT=True' if (voicebot and str(voicebot).lower() == 'true') else f'CUSTOMDIALERDST={customdialerdst!r}'
             logger.debug(
-                "Campaign %s: CUSTOMDIALERDST=%r => POWER DIALER mode, "
+                "Campaign %s: %s => POWER DIALER mode, "
                 "allowed_parallel_contact_attempts=%s",
-                id_campaign, customdialerdst, num_available_channels
+                id_campaign, reason, num_available_channels
             )
             return num_available_channels
 
@@ -1319,12 +1577,24 @@ class AverageWorker(DialerWorker):
             target_capped, calls_to_dial
         )
 
+        # Si estamos en o por encima del target, pero hay agentes y canales disponibles,
+        # permitir al menos 1 llamada para mantener el target activo
+        # (esto evita que el dialer se detenga cuando target == active_channels)
         if calls_to_dial <= 0:
-            logger.debug(
-                "Campaign %s: already at or above desired load (calls_to_dial<=0). Returning 0.",
-                id_campaign
-            )
-            return 0
+            if available_agents_score > 0 and num_available_channels > 0:
+                # Hay capacidad disponible: permitir 1 llamada para mantener el target
+                calls_to_dial = 1
+                logger.debug(
+                    "Campaign %s: at target but allowing 1 call to maintain active load "
+                    "(agents=%s, channels_available=%s)",
+                    id_campaign, available_agents_score, num_available_channels
+                )
+            else:
+                logger.debug(
+                    "Campaign %s: already at or above desired load (calls_to_dial<=0). Returning 0.",
+                    id_campaign
+                )
+                return 0
 
         # 6) Respetar canales libres reales
         final_allowed = min(calls_to_dial, num_available_channels)
@@ -1366,6 +1636,40 @@ class AverageWorker(DialerWorker):
         # TODO: think if the following could be a background job call
         cls.GM_CLIENT.submit_job('process-contact', message)
 
+
+
+
+
+    @classmethod
+    def is_blacklisted(cls, phone_number):
+        """
+        Verifica si un número está en la lista negra de OML.
+        Retorna True si está bloqueado, False si puede ser llamado.
+        """
+        if not phone_number:
+            return False
+
+        cls.connect_redis_oml()
+        black_list_key = 'OML:BLACKLIST'
+
+        try:
+            # sismember retorna 1 si existe, 0 si no. En Python bool(1) es True.
+            is_black_listed = cls.REDIS_OML_CONNECTION.sismember(
+                black_list_key, phone_number
+            )
+            if is_black_listed:
+                logger.warning(
+                    f"BLOCKED: Phone number {phone_number} is in BLACKLIST"
+                )
+            return bool(is_black_listed)
+        except Exception as e:
+            logger.error(f"Error checking BLACKLIST for {phone_number}: {e}")
+            # Ante error de Redis, decidimos si bloquear o permitir.
+            # Por seguridad (fail-open vs fail-close), aquí permitimos llamar
+            # (False), pero podrías retornar True si prefieres bloquear
+            # ante la duda.
+            return False
+
     @classmethod
     @job_handler_decorator
     def process_contact(cls, worker, job):
@@ -1373,76 +1677,121 @@ class AverageWorker(DialerWorker):
         id_campaign = data['id_campaign']
         contact = data['contact']
         id_contact = contact[0]
+        phone_number = contact[2]
+
+        # --- CHECK BLACKLIST ---
+        if cls.is_blacklisted(phone_number):
+            logger.info(
+                f"Campaign {id_campaign}: Contact {id_contact} "
+                f"({phone_number}) skipped (BLACKLIST)"
+            )
+
+            # Finalizamos el contacto en la DB para que no se vuelva a intentar
+            with cls.get_dialer_connection() as conn_dialer:
+                cursor_dialer = conn_dialer.cursor()
+                cursor_dialer.execute(
+                    'UPDATE contact_in_campaign SET final_status = %s, '
+                    'status = %s, schedule_aborted = false '
+                    'WHERE id_contact = %s AND id_campaign = %s',
+                    (FINALIZED_NOCONTACT, STATUS_CHANUNAVAIL, id_contact,
+                     id_campaign)
+                    # Usamos CHANUNAVAIL o un estatus específico si tuvieras
+                    # STATUS_BLACKLISTED
+                )
+
+            # Liberamos la reserva que se hizo en el loop
+            cls.connect_redis_dialer()
+            key_calls = f'OML:CALLS:{id_campaign}:DIALER'
+            cls.REDIS_DIALER_CONNECTION.decrby(key_calls, 1)
+            
+            # Actualizamos Redis para estadísticas
+            cls.REDIS_DIALER_CONNECTION.hset(
+                f'CONTACT:{id_contact}:CAMP:{id_campaign}', 'STATUS', FINALIZED_NOCONTACT
+            )
+            return b'Contact skipped: Blacklisted'
+
         with cls.get_dialer_connection() as conn_dialer:
             cursor_dialer = conn_dialer.cursor()
             status_campaign = cls.get_campaign_status(id_campaign, cursor_dialer)
+            
             if status_campaign == ACTIVE:
                 if cls.is_allowed_to_call(id_campaign)[0]:
-                    logger.debug(
-                        f'Attempting to make a contact in campaign {id_campaign} '
-                        f'to contact {id_contact}')
-                    cls.attempt_contact_asterisk(contact, id_campaign)
+                    
+                    # --- NOTA: La reserva ya se hizo en process_campaign_inside ---
+                    # Solo necesitamos hacer rollback si falla
                     cls.connect_redis_dialer()
-                    cls.REDIS_DIALER_CONNECTION.hincrby(
-                        f'CAMP:{id_campaign}:COUNTER',
-                        'ATTEMPTED_CALLS',
-                    )
-                    return b'Contact was called'
+                    key_calls = f'OML:CALLS:{id_campaign}:DIALER'
+                    
+                    try:
+                        logger.debug(f'Calling contact {id_contact} (reservation already made)')
+                        # Aplicar prefijo si existe; publicar en cola Gearman (ACD hace ruta/troncal)
+                        phone_to_dial = phone_number
+                        prefix = cls.get_prefix(id_campaign)
+                        if prefix:
+                            try:
+                                phone_to_dial = prefix[0] + phone_number
+                            except Exception:
+                                phone_to_dial = str(prefix) + phone_number
+                        success = cls.trigger_acd_dial(
+                            phone_to_dial, id_campaign, id_contact, attributes=None
+                        )
+                        if not success:
+                            raise Exception("Failed to send dial job to Gearman")
+                        
+                        # Contabilizar el intento exitoso
+                        cls.REDIS_DIALER_CONNECTION.hincrby(
+                            f'CAMP:{id_campaign}:COUNTER', 'ATTEMPTED_CALLS'
+                        )
+                        return b'Contact was called'
+                        
+                    except Exception as e:
+                        # --- ROLLBACK DE RESERVA ---
+                        # Si falló el envío a Gearman, liberamos la reserva
+                        try:
+                            calls = cls.REDIS_DIALER_CONNECTION.decrby(key_calls, 1)
+                            # Protección contra valores negativos
+                            if calls < 0:
+                                cls.REDIS_DIALER_CONNECTION.set(key_calls, 0)
+                                logger.warning(
+                                    f"Redis counter went negative for campaign {id_campaign}, "
+                                    f"reset to 0"
+                                )
+                        except Exception as redis_error:
+                            logger.error(
+                                f"Error during rollback of Redis counter: {redis_error}"
+                            )
+                        logger.error(f"Error sending dial job to Gearman, reservation rolled back: {e}")
+                        
+                        # Marcamos para reintento en DB
+                        cursor_dialer.execute(
+                            'UPDATE contact_in_campaign SET status = %s WHERE id_contact = %s AND id_campaign = %s',
+                            (STATUS_CREATED, id_contact, id_campaign)
+                        )
+                        return b'Contact call failed, marked for retry'
                 else:
-                    logger.debug(
-                        f'Campaign {id_campaign} is not allowed to call at the moment, '
-                        f'aborting call to contact {id_contact}')
-            elif status_campaign == PAUSED:
-                logger.debug(
-                    f'Campaign {id_campaign} is paused, aborting call to contact {id_contact}')
+                    # No está permitido llamar (horario), liberamos la reserva
+                    cls.connect_redis_dialer()
+                    key_calls = f'OML:CALLS:{id_campaign}:DIALER'
+                    cls.REDIS_DIALER_CONNECTION.decrby(key_calls, 1)
+                    
+                    # Marcamos para reintento
+                    cursor_dialer.execute(
+                        'UPDATE contact_in_campaign SET status = %s WHERE id_contact = %s AND id_campaign = %s',
+                        (STATUS_CREATED, id_contact, id_campaign)
+                    )
+                    return b'Contact skipped: Not allowed to call (hours)'
             else:
-                logger.debug(
-                    f'Campaign {id_campaign} is finalized, aborting call to contact {id_contact}')
-                # status_campaign == FINALIZED
-            cursor_dialer.execute('UPDATE contact_in_campaign SET schedule_aborted = true'
-                                  ' WHERE id_contact = %s AND id_campaign = %s',
-                                  (id_contact, id_campaign))
-            return b'Aborted call, campaign is not active'
-
-    @classmethod
-    def attempt_contact_asterisk(cls, contact_info, id_campaign):
-        logger.debug(f'Campaign {id_campaign}: trying to call the contact')
-        id_customer = contact_info[0]
-        phone_number = contact_info[2]
-        prefix = cls.get_prefix(id_campaign)
-        if prefix is not None:
-            phone_number = prefix[0] + phone_number
-
-        # callid generate
-        epoch = int(time.time())
-        callid = f"{epoch}.{contact_info[0]}"
-
-        queue_timeout = 20
-        channel_type = 'to_omlacd_dialout'
-        caller_id = f'{id_campaign}_{id_customer}_{phone_number}'
-        variables = {
-            'PJSIP_HEADER(add,OMLCODCLI)': f'{id_customer}',
-            'PJSIP_HEADER(add,OMLCAMPID)': f'{id_campaign}',
-            'PJSIP_HEADER(add,OMLOUTNUM)': f'{phone_number}',
-            'PJSIP_HEADER(add,OMLUNIQUEID)': f'{callid}',
-        }
-        call_type = 2
-        endpoint = f'PJSIP/{phone_number}@{DIALER_ACD_HOST}'
-        appArgs = f"""id_camp: {id_campaign}, id_customer: {id_customer},
-    tel_customer: {phone_number}, queue_timeout: {queue_timeout},
-    channel_type: {channel_type}, call_type: {call_type}, uniqueid: {callid}"""
-
-        logger.debug(f"""Calling contact {id_customer} with phone {phone_number}
-    in campaign {id_campaign} using callid {callid}""")
-
-        response = cls.ari.originate_channel(
-            endpoint=endpoint,
-            app=ASTERISK_APP,
-            callerId=caller_id,
-            appArgs=appArgs,
-            variables=variables
-        )
-        logger.debug(response)
+                # Campaña no activa, liberamos la reserva
+                cls.connect_redis_dialer()
+                key_calls = f'OML:CALLS:{id_campaign}:DIALER'
+                cls.REDIS_DIALER_CONNECTION.decrby(key_calls, 1)
+                
+                # Marcamos para reintento
+                cursor_dialer.execute(
+                    'UPDATE contact_in_campaign SET status = %s WHERE id_contact = %s AND id_campaign = %s',
+                    (STATUS_CREATED, id_contact, id_campaign)
+                )
+                return b'Contact skipped: Campaign not active'
 
     @classmethod
     @job_handler_decorator
@@ -1501,6 +1850,9 @@ class AverageWorker(DialerWorker):
     @classmethod
     @timed_lru_cache(seconds=600, maxsize=128)
     def get_prefix(cls, id_campaign):
+        # Campaña 0: no hay prefijo configurado en BD
+        if id_campaign == 0:
+            return None
         logger.debug(f'Campaign {id_campaign}: getting prefix')
         with cls.get_dialer_connection() as conn_dialer:
             cursor_dialer = conn_dialer.cursor()
@@ -1645,15 +1997,115 @@ class AverageWorker(DialerWorker):
     @job_handler_decorator
     def process_event(cls, worker, job):
         ari_event_data = cls.decode_payload(job.data)
-        id_campaign, contact_id, phone_number = cls.get_contact_data(ari_event_data)
+        event_type = ari_event_data.get('type', 'unknown')
+        call_type = ari_event_data.get('call_type', '')
+        dialstatus = ari_event_data.get('dialstatus', '')
+        dialstring = ari_event_data.get('dialstring', '')
+
+        try:
+            id_campaign, contact_id, phone_number = cls.get_contact_data(ari_event_data)
+        except (KeyError, TypeError, ValueError) as e:
+            logger.warning(
+                "process_event: no se pudo extraer contact_data del payload | type=%s call_type=%s "
+                "error=%s payload_keys=%s",
+                event_type, call_type, e, list(ari_event_data.keys()) if ari_event_data else [],
+            )
+            raise
+
+        logger.info(
+            "process_event: recibido | campaign=%s contact=%s phone=%s type=%s call_type=%s "
+            "dialstatus=%s dialstring=%s",
+            id_campaign, contact_id, phone_number, event_type, call_type, dialstatus, dialstring,
+        )
+
+        # ----- RouteValidationFailed (llamada bloqueada por validación de ruta): decrementar -----
+        if event_type == 'RouteValidationFailed':
+            if int(id_campaign or 0) == 0:
+                logger.debug(
+                    "process_event: RouteValidationFailed ignorado (campaña 0)",
+                )
+                return b'Event was processed'
+            cls.connect_redis_dialer()
+            key_calls = f'OML:CALLS:{id_campaign}:DIALER'
+            try:
+                val = cls.REDIS_DIALER_CONNECTION.decr(key_calls)
+                if val < 0:
+                    cls.REDIS_DIALER_CONNECTION.set(key_calls, 0)
+                    logger.warning(
+                        "Campaign %s: call count went negative on RouteValidationFailed, reset to 0",
+                        id_campaign,
+                    )
+            except Exception as e:
+                logger.error(
+                    "Campaign %s: error decrementing call count on RouteValidationFailed: %s",
+                    id_campaign, e,
+                    exc_info=True,
+                )
+            cls.GM_CLIENT.submit_job('send-reports', job.data, background=True)
+            logger.info(
+                "process_event: RouteValidationFailed, decrement | campaign=%s contact=%s phone=%s",
+                id_campaign, contact_id, phone_number,
+            )
+            return b'Event was processed'
+
+        # ----- ChannelDestroyed (canal PSTN liberado): decrementar y reportar -----
+        if event_type in ('ChannelDestroyed', 'ChannelDestroy'):
+            if call_type == 'to_pstn' and int(id_campaign or 0) != 0:
+                cls.connect_redis_dialer()
+                key_calls = f'OML:CALLS:{id_campaign}:DIALER'
+                try:
+                    val = cls.REDIS_DIALER_CONNECTION.decr(key_calls)
+                    if val < 0:
+                        cls.REDIS_DIALER_CONNECTION.set(key_calls, 0)
+                        logger.warning(
+                            "Campaign %s: call count went negative on ChannelDestroyed, reset to 0",
+                            id_campaign,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "Campaign %s: error decrementing call count on ChannelDestroyed: %s",
+                        id_campaign, e,
+                        exc_info=True,
+                    )
+                cls.GM_CLIENT.submit_job('send-reports', job.data, background=True)
+                logger.debug(
+                    "process_event: ChannelDestroyed to_pstn, decrement y send-reports | campaign=%s",
+                    id_campaign,
+                )
+            else:
+                logger.debug(
+                    "process_event: ChannelDestroyed ignorado (call_type=%s o campaña 0)",
+                    call_type,
+                )
+            return b'Event was processed'
+
+        # ----- Dial: solo eventos terminales (ANSWER o fallo); intermedios (vacío, RINGING) se ignoran -----
+        if event_type != 'Dial':
+            logger.debug("process_event: tipo %s no manejado, omitiendo", event_type)
+            return b'Event was processed'
+
+        # Intermedios: no actualizar estado ni enviar send-reports
+        if dialstatus in ('', 'RINGING') or dialstatus is None:
+            logger.debug(
+                "process_event: Dial intermedio (dialstatus=%r), sin actualizar estado ni send-reports",
+                dialstatus,
+            )
+            return b'Event was processed'
+
         if cls.is_answer_event(ari_event_data):
             if cls.is_answered_pstn(ari_event_data):
                 status = "ANSWERED_PSTN"
-                logger.debug(f'Campaign {id_campaign}: receiving answer pstn')
+                logger.info(
+                    "process_event: ANSWERED_PSTN (troncal) | campaign=%s contact=%s phone=%s",
+                    id_campaign, contact_id, phone_number,
+                )
                 cls.set_contact_status(id_campaign, contact_id, status)
             elif cls.is_answered_agent(ari_event_data):
                 status = "ANSWERED_AGENT"
-                logger.debug(f'Campaign {id_campaign}: Receiving answer agent')
+                logger.info(
+                    "process_event: ANSWERED_AGENT (cola) | campaign=%s contact=%s phone=%s",
+                    id_campaign, contact_id, phone_number,
+                )
                 cls.set_contact_status(id_campaign, contact_id, status)
                 cls.connect_redis_dialer()
                 with cls.get_dialer_connection() as conn_dialer:
@@ -1663,11 +2115,51 @@ class AverageWorker(DialerWorker):
                                           (FINALIZED_SUCCESS, id_campaign, contact_id))
                     cls.REDIS_DIALER_CONNECTION.hset(
                         f'CONTACT:{contact_id}:CAMP:{id_campaign}', 'STATUS', FINALIZED_SUCCESS)
-                logger.debug(f'Contact {contact_id} was succesfully called to phone {phone_number}'
-                             f' in campaign {id_campaign}')
+                logger.info(
+                    "process_event: contacto finalizado con éxito | campaign=%s contact=%s phone=%s",
+                    id_campaign, contact_id, phone_number,
+                )
         elif cls.is_fail_event(ari_event_data):
+            fail_status = cls.decode_fail_event(ari_event_data)
+            logger.info(
+                "process_event: evento fallo (Dial) | campaign=%s contact=%s phone=%s dialstatus=%s "
+                "decoded=%s",
+                id_campaign, contact_id, phone_number, dialstatus, fail_status,
+            )
             cls.handle_fail_event(ari_event_data, id_campaign, contact_id, phone_number)
+            # CANCEL/AMD: decrement aquí (ari-app no envía ChannelDestroyed para CANCEL ni para AMD MACHINE)
+            if dialstatus in ('CANCEL', 'AMD') and int(id_campaign or 0) != 0:
+                cls.connect_redis_dialer()
+                key_calls = f'OML:CALLS:{id_campaign}:DIALER'
+                try:
+                    val = cls.REDIS_DIALER_CONNECTION.decr(key_calls)
+                    if val < 0:
+                        cls.REDIS_DIALER_CONNECTION.set(key_calls, 0)
+                        logger.warning(
+                            "Campaign %s: call count went negative on Dial %s, reset to 0",
+                            id_campaign, dialstatus,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "Campaign %s: error decrementing call count on Dial %s: %s",
+                        id_campaign, dialstatus, e,
+                        exc_info=True,
+                    )
+                logger.debug(
+                    "process_event: Dial %s, decrement | campaign=%s",
+                    dialstatus, id_campaign,
+                )
+        else:
+            logger.debug(
+                "process_event: Dial no answer ni fail (ignorado) | campaign=%s contact=%s dialstatus=%s",
+                id_campaign, contact_id, dialstatus,
+            )
+
         cls.GM_CLIENT.submit_job('send-reports', job.data, background=True)
+        logger.debug(
+            "process_event: finalizado, job send-reports enviado | campaign=%s contact=%s",
+            id_campaign, contact_id,
+        )
         return b'Event was processed'
 
     @classmethod
@@ -1704,18 +2196,56 @@ class AverageWorker(DialerWorker):
 
     @classmethod
     def get_contact_data(cls, ari_event_data):
-        return ari_event_data['peer']['caller']['name'].split('_')
+        """
+        Extrae id_campaign, contact_id y phone_number del payload del evento.
+        Compatible con eventos Dial (ARI) y ChannelDestroyed (ACD construye peer.caller.name
+        con formato id_camp_id_contact_phone).
+        """
+        peer = ari_event_data.get('peer') or {}
+        caller = peer.get('caller') if isinstance(peer, dict) else {}
+        name = caller.get('name') if isinstance(caller, dict) else None
+        if not name:
+            raise KeyError('peer.caller.name')
+        parts = name.split('_')
+        if len(parts) < 3:
+            raise ValueError(f'peer.caller.name debe tener al menos 3 segmentos: {name!r}')
+        phone = '_'.join(parts[2:]) if len(parts) > 2 else ''
+        return parts[0], parts[1], phone
 
     @classmethod
     def is_answered_pstn(cls, ari_event_data):
-        return ari_event_data['dialstring'].find('camp_') == -1
+        """
+        Indica si la respuesta fue PSTN (troncal).
+        Usa call_type cuando el ACD lo envía (to_pstn / to_agent); fallback a dialstring.
+        """
+        call_type = ari_event_data.get('call_type')
+        if call_type == 'to_pstn':
+            return True
+        if call_type == 'to_agent':
+            return False
+        dialstring = ari_event_data.get('dialstring') or ''
+        return dialstring.find('camp_') == -1
 
     @classmethod
     def is_answered_agent(cls, ari_event_data):
-        return ari_event_data['dialstring'].find('camp_') >= 0
+        """
+        Indica si la respuesta fue agente (cola).
+        Usa call_type cuando el ACD lo envía; fallback a dialstring.
+        """
+        call_type = ari_event_data.get('call_type')
+        if call_type == 'to_agent':
+            return True
+        if call_type == 'to_pstn':
+            return False
+        dialstring = ari_event_data.get('dialstring') or ''
+        return dialstring.find('camp_') >= 0
 
     @classmethod
     def set_contact_status(cls, id_campaign, contact_id, status, type_status=PHONE_TYPE):
+        # Campaña 0 o contacto 0: ignorar eventos de estado (casos de sistema)
+        if int(id_campaign) == 0 or int(contact_id or 0) == 0:
+            logger.info(f"SYSTEM EVENT: Status {status} ignored for ID 0")
+            return
         status_code = NAME_TO_STATUS[status]
         with cls.get_dialer_connection() as conn_dialer:
             cursor_dialer = conn_dialer.cursor()
@@ -1853,6 +2383,11 @@ class AverageWorker(DialerWorker):
         cls.connect_redis_dialer()
         ari_event_data = cls.decode_payload(job.data)
         id_campaign, contact_id, phone_number = cls.get_contact_data(ari_event_data)
+
+        # GUARDIA: Si es campaña de sistema (ID 0), no generamos reportes de base de datos
+        if int(id_campaign) == 0:
+            return b'Success: System campaign reports skipped'
+
         previous_stats = cls.REDIS_DIALER_CONNECTION.hgetall(f'CAMP:{id_campaign}:COUNTER_PREV') \
             or {}
         with cls.get_dialer_connection() as conn_dialer:
@@ -1962,8 +2497,68 @@ class AverageWorker(DialerWorker):
             return b'Disposition for incidence rule was added!'
 
     @classmethod
+    def audit_active_channels(cls):
+        """
+        Sincroniza el conteo de canales activos con Redis.
+        La fuente de verdad de canales queda en el ACD/Gearman; este método está preparado
+        para recibir en el futuro una lista de canales (p. ej. vía API o job) y actualizar Redis.
+        """
+        logger.info("Iniciando auditoría de canales activos (Sanity Check)...")
+        
+        try:
+            # Fuente de canales: en el futuro puede venir de ACD/Gearman o API
+            channels = []  # Sin conexión ARI directa; rellenar cuando exista integración
+
+            # 2. Mapear canales por id_campaign
+            # El caller_id tiene formato: {id_campaign}_{id_customer}_{phone_number}
+            actual_counts = {}
+            
+            for chan in channels:
+                caller_name = chan.get('caller', {}).get('name', '')
+                if not caller_name:
+                    continue
+                
+                parts = caller_name.split('_')
+                if len(parts) >= 2:
+                    try:
+                        camp_id = int(parts[0])
+                        actual_counts[camp_id] = actual_counts.get(camp_id, 0) + 1
+                    except ValueError:
+                        continue
+
+            # 3. Obtener todas las campañas que Redis cree que tienen llamadas
+            cls.connect_redis_dialer()
+            # Buscamos todas las llaves OML:CALLS:*:DIALER
+            redis_keys = cls.REDIS_DIALER_CONNECTION.keys('OML:CALLS:*:DIALER')
+            
+            pipe = cls.REDIS_DIALER_CONNECTION.pipeline()
+
+            # 4. Sincronizar campañas activas según conteo de canales
+            for camp_id, count in actual_counts.items():
+                key = f'OML:CALLS:{camp_id}:DIALER'
+                logger.debug(f"Audit: Campaña {camp_id} tiene {count} canales reales.")
+                pipe.set(key, count)
+
+            # 5. Limpiar campañas que Redis cree que tienen llamadas pero el conteo real es 0
+            for key in redis_keys:
+                try:
+                    # Extraer ID de la campaña de la llave 'OML:CALLS:{id}:DIALER'
+                    camp_id_in_redis = int(key.split(':')[2])
+                    if camp_id_in_redis not in actual_counts:
+                        logger.warning(f"Audit: Campaña {camp_id_in_redis} en Redis tiene llamadas huérfanas. Reseteando a 0.")
+                        pipe.set(key, 0)
+                except (IndexError, ValueError):
+                    continue
+
+            pipe.execute()
+            logger.info("Auditoría completada exitosamente.")
+
+        except Exception as e:
+            logger.error(f"Error crítico en audit_active_channels: {e}", exc_info=True)
+
+    @classmethod
     def handle_amd_option(cls, data):
-        event = 'TERMINATED'
+        event = 'AMD'  # entidad propia: history (10, 1) y métricas "AMD Detected"
         id_campaign = data['id_campaign']
         id_contact = data['id_contact']
         phone_number = data['phone_number']
@@ -2229,7 +2824,7 @@ class SchedulerWorker(AverageWorker):
         'default': RedisJobStore(
             host=REDIS_DIALER_SERVER,
             port=int(REDIS_DIALER_PORT),
-            db=int(os.getenv('REDIS_DIALER_DB', 3)),
+            db=REDIS_DIALER_DB,
             jobs_key='apscheduler.jobs',
             run_times_key='apscheduler.run_times',
             # password=os.getenv('REDIS_DIALER_PASSWORD')
@@ -2247,7 +2842,7 @@ class SchedulerWorker(AverageWorker):
         return redis.StrictRedis(
             host=REDIS_DIALER_SERVER,
             port=int(REDIS_DIALER_PORT),
-            db=int(os.getenv('REDIS_DIALER_DB', 3)),
+            db=REDIS_DIALER_DB,
             decode_responses=True,
         )
 
@@ -2315,7 +2910,7 @@ class SchedulerWorker(AverageWorker):
         try:
             added = r.sadd(seen_key, job_id)  # 1 si no existía
             if added == 1:
-                r.expire(seen_key, 7 * 24 * 3600)  # housekeeping del set
+                r.expire(seen_key, AverageWorker.SEEN_TTL_SECONDS)
                 AverageWorker.agendas_decrement(camp_id, 1)
         except Exception as e:
             logger.error("Fallo decremento seen-set para camp %s job %s: %s", camp_id, job_id, e)
@@ -2348,29 +2943,62 @@ class SchedulerWorker(AverageWorker):
         )
 
     @classmethod
+    def _replacing_key(cls, job_id: str) -> str:
+        return f"SCHED:REPLACING:{job_id}"
+
+    @classmethod
+    def _is_replacing(cls, job_id: str) -> bool:
+        """True si el job_id está siendo reemplazado (replace_existing)."""
+        try:
+            return bool(cls._redis().get(cls._replacing_key(job_id)))
+        except Exception:
+            logger.debug("No se pudo leer replacing flag para %s", job_id, exc_info=True)
+            return False
+
+    @classmethod
     def _agenda_decrement_listener(cls, event):
-        """Listener unificado: log + decremento idempotente."""
+        """Listener unificado: log + decremento idempotente (y safe ante replace_existing)."""
         try:
             jobstore = getattr(event, "jobstore", "unknown")
             evt = cls._event_name(event.code)
 
-            job = cls.SCHEDULER.get_job(event.job_id)
-            camp_id = cls._extract_campaign_id_from_job_or_id(job, getattr(event, "job_id", None))
+            # IMPORTANTE: en REMOVED el job puede ya no existir en el scheduler.
+            job = None
+            try:
+                job = cls.SCHEDULER.get_job(event.job_id)
+            except Exception:
+                job = None
+
+            camp_id = cls._extract_campaign_id_from_job_or_id(
+                job, getattr(event, "job_id", None)
+            )
 
             logger.info(
                 "SCHED EVT %s | job_id=%s jobstore=%s campaign_id=%s",
                 evt, event.job_id, jobstore, camp_id,
             )
 
-            # Decremento idempotente en eventos que consumen/agotan agendas
-            if (event.code in (
-                EVENT_JOB_EXECUTED, EVENT_JOB_ERROR, EVENT_JOB_REMOVED, EVENT_JOB_MISSED
-            )
-                    and camp_id is not None):
+            # (1) Si es REMOVED por replace_existing => NO decrementar.
+            if event.code == EVENT_JOB_REMOVED:
+                if cls._is_replacing(event.job_id):
+                    logger.info(
+                        "SCHED EVT REMOVED por replace_existing (skip decrement) job_id=%s",
+                        event.job_id
+                    )
+                    return
+
+            # (2) Decremento idempotente en eventos terminales
+            if (
+                event.code in (
+                    EVENT_JOB_EXECUTED, EVENT_JOB_ERROR, EVENT_JOB_REMOVED,
+                    EVENT_JOB_MISSED
+                )
+                and camp_id is not None
+            ):
                 cls._agendas_decrement_once(camp_id, event.job_id)
 
         except Exception as e:
-            logger.warning("Agenda decrement/log listener failed: %s", e)
+            logger.warning("Agenda decrement/log listener failed: %s", e, exc_info=True)
 
     @classmethod
     def _register_listener_once(cls):
@@ -2390,12 +3018,19 @@ class SchedulerWorker(AverageWorker):
     @classmethod
     def schedule_contact(cls, phone_number, id_campaign, id_contact):
         logger.debug(f'Campaign {id_campaign}: firing scheduled agenda for contact {id_contact}')
-        message = json.dumps({
-            'contact': [id_contact, id_campaign, phone_number],
-            'id_campaign': id_campaign
-        })
-        cls.GM_CLIENT.submit_job('process-contact', message, background=True)
-        return 'GD!!!'
+        # Enviar llamada a través de ACD usando Gearman
+        success = cls.trigger_acd_dial(
+            phone_number=phone_number,
+            campaign_id=id_campaign,
+            contact_id=id_contact
+        )
+        if success:
+            return 'GD!!!'
+        else:
+            logger.warning(
+                f'Campaign {id_campaign}: Failed to send dial job for contact {id_contact}'
+            )
+            return 'Error sending dial job'
 
     @classmethod
     def schedule_process_campaign(cls, id_campaign):
@@ -2420,6 +3055,21 @@ class SchedulerWorker(AverageWorker):
         def _parse_naive(dt_str: str) -> datetime.datetime:
             return datetime.datetime.strptime(dt_str, '%d/%m/%y %H:%M:%S')
 
+        # Helper: limpiar seen siempre (corrige punto 2)
+        def _clear_seen(job_id: str):
+            try:
+                cls._redis().srem(cls._camp_seen_key(id_campaign), job_id)
+            except Exception as e:
+                logger.warning("No se pudo limpiar seen set para %s: %s", job_id, e)
+
+        # Helper: marcar reemplazo SIEMPRE (robusto ante falsos negativos de exists)
+        def _mark_replacing(job_id: str):
+            try:
+                # TTL corto: cubre la ventana de REMOVED->ADDED durante replace_existing
+                cls._redis().setex(cls._replacing_key(job_id), 5, "1")
+            except Exception:
+                logger.debug("No se pudo setear replacing flag para %s", job_id, exc_info=True)
+
         if schedule_type == 'process-campaign':
             datetime_start_str = data.get('datetime_start', '')
             if not datetime_start_str:
@@ -2427,11 +3077,16 @@ class SchedulerWorker(AverageWorker):
 
             run_date = _parse_naive(datetime_start_str)
 
-            # ID único (permite reprogramar sin doble incrementar)
+            # ID único determinístico: permite reprogramar sin doble incrementar
             job_id = f'process_campaign:{id_campaign}:{run_date.strftime("%Y%m%d%H%M%S")}'
             name = f'scheduled_process_campaign_{id_campaign}'
 
+            # exists se usa SOLO para decidir incremento; no para replacing
             exists = cls.SCHEDULER.get_job(job_id) is not None
+
+            # replace_existing=True => marcamos replacing siempre
+            _mark_replacing(job_id)
+
             cls.SCHEDULER.add_job(
                 cls.schedule_process_campaign,
                 trigger='date',
@@ -2440,19 +3095,20 @@ class SchedulerWorker(AverageWorker):
                 id=job_id,
                 name=name,
                 replace_existing=True,
-                misfire_grace_time=3600,   # 1h de gracia por si el contenedor estuvo caído
+                misfire_grace_time=3600,
                 coalesce=True,
                 max_instances=1,
             )
+
             cls._log_job_add(job_id=job_id, name=name, run_date=run_date, exists_before=exists)
 
+            # Limpiar seen siempre al agendar (exista o no)
+            _clear_seen(job_id)
+
+            # Incremento sólo si no existía (no duplicar agendas)
             if not exists:
                 AverageWorker.agendas_increment(id_campaign, 1)
-                try:
-                    r = cls._redis()
-                    r.srem(cls._camp_seen_key(id_campaign), job_id)
-                except Exception as e:
-                    logger.warning("No se pudo limpiar seen set para %s: %s", job_id, e)
+
             return b'Campaign process was scheduled'
 
         # Agenda de contacto
@@ -2461,14 +3117,23 @@ class SchedulerWorker(AverageWorker):
             return b'Missing datetime_agenda'
 
         run_date = _parse_naive(datetime_agenda_str)
+        id_contact = data.get('id_contact')
         phone_number = data.get('phone_number', '')
-        id_contact = data.get('id_contact', '')
+        if not id_contact:
+            job_id = (
+                f'agenda_contact:{id_campaign}:{phone_number}:'
+                f'{run_date.strftime("%Y%m%d%H%M%S")}'
+            )
+        else:
+            job_id = f'agenda_contact:{id_campaign}:{id_contact}'
 
-        # ID determinístico por contacto+campaña (evita doble incremento al reprogramar)
-        job_id = f'agenda_contact:{id_campaign}:{id_contact}'
         name = f'agenda_contact_{id_campaign}_{id_contact}'
 
         exists = cls.SCHEDULER.get_job(job_id) is not None
+
+        # replace_existing=True => marcamos replacing siempre
+        _mark_replacing(job_id)
+
         cls.SCHEDULER.add_job(
             cls.schedule_contact,
             trigger='date',
@@ -2481,13 +3146,12 @@ class SchedulerWorker(AverageWorker):
             coalesce=True,
             max_instances=1,
         )
+
         cls._log_job_add(job_id=job_id, name=name, run_date=run_date, exists_before=exists)
+
+        _clear_seen(job_id)
 
         if not exists:
             AverageWorker.agendas_increment(id_campaign, 1)
-            try:
-                r = cls._redis()
-                r.srem(cls._camp_seen_key(id_campaign), job_id)
-            except Exception as e:
-                logger.warning("No se pudo limpiar seen set para %s: %s", job_id, e)
+
         return b'Agenda was scheduled'

@@ -13,8 +13,10 @@ from datetime import timedelta
 from gearman.job import GearmanJob
 from gearman.worker import GearmanWorker
 
-from handler.naive import (AverageWorker, ACTIVE, PAUSED, CREATED, FINALIZED, STATUS_SELECTED_CALL,
-                           STATUS_CREATED)
+from handler.naive import (
+    AverageWorker, ACTIVE, PAUSED, CREATED, FINALIZED, STATUS_SELECTED_CALL,
+    STATUS_CREATED, FINALIZED_NOCONTACT, STATUS_AMD_MACHINE
+)
 
 
 class MyTestSuite(unittest.TestCase):
@@ -357,7 +359,7 @@ class MyTestSuite(unittest.TestCase):
                 """INSERT INTO incidence_rules (id, status, status_custom, max_attempt,
                 retry_later, in_mode, campaign_id) VALUES
                 (%s, %s, %s, %s, %s, %s, %s);""",
-                (3, 2, 'terminated', 1, 7, 1, 4))
+                (3, STATUS_AMD_MACHINE, 'amd', 1, 7, 1, 4))
         # testing endpoint add disposition for incidence rule
         job = GearmanJob(
             None, None, b'add-incidence-rule-disposition',
@@ -496,6 +498,143 @@ class MyTestSuite(unittest.TestCase):
 
         allowed_calls = AverageWorker.allowed_calls_prority_percentage(4, 50)
         self.assertEqual(allowed_calls, 6)
+
+    def test_is_blacklisted_true(self):
+        """Verifica que is_blacklisted devuelva True si Redis dice que sí"""
+        AverageWorker.connect_redis_oml = MagicMock()
+        # Simulamos que redis.sismember devuelve 1 (True)
+        AverageWorker.REDIS_OML_CONNECTION.sismember = MagicMock(return_value=1)
+
+        self.assertTrue(AverageWorker.is_blacklisted("11223344"))
+        AverageWorker.REDIS_OML_CONNECTION.sismember.assert_called_with('OML:BLACKLIST', "11223344")
+
+    def test_is_blacklisted_false(self):
+        """Verifica que is_blacklisted devuelva False si Redis dice que no"""
+        AverageWorker.connect_redis_oml = MagicMock()
+        # Simulamos que redis.sismember devuelve 0 (False)
+        AverageWorker.REDIS_OML_CONNECTION.sismember = MagicMock(return_value=0)
+
+        self.assertFalse(AverageWorker.is_blacklisted("99999999"))
+
+    def test_process_contact_skips_blacklisted(self):
+        """
+        Verifica que process_contact NO llame a Asterisk y marque el contacto
+        como finalizado si el número está en blacklist.
+        """
+        # 1. Configurar Mock de Blacklist para que diga que SÍ está bloqueado
+        AverageWorker.is_blacklisted = MagicMock(return_value=True)
+
+        # 2. Mockear intento de llamada (no debería llamarse)
+        AverageWorker.attempt_contact_asterisk = MagicMock()
+
+        # 3. Crear el Job
+        contact_id = 1
+        phone_number = "6093017590"
+        job_data = {
+            "contact": [contact_id, 4, phone_number],
+            "id_campaign": 4
+        }
+        job = GearmanJob(
+            None, None, b'process-contact',
+            bytes(str(uuid.uuid4()), encoding='utf8'),
+            self.encode_payload(job_data)
+        )
+
+        # 4. Ejecutar el worker
+        result = AverageWorker.process_contact(self.worker, job)
+
+        # 5. Aserciones (Verificaciones)
+
+        # a) El worker debe devolver el mensaje de skip
+        self.assertEqual(result, b'Contact skipped: Blacklisted')
+
+        # b) NO debe haber intentado llamar a Asterisk
+        AverageWorker.attempt_contact_asterisk.assert_not_called()
+
+        # c) Debe haber actualizado la DB a FINALIZED_NOCONTACT (2)
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn_dialer:
+            cursor_dialer = conn_dialer.cursor()
+            cursor_dialer.execute(
+                "SELECT final_status, schedule_aborted FROM contact_in_campaign "
+                "WHERE id_contact = %s AND id_campaign = %s;",
+                (contact_id, 4)
+            )
+            row = cursor_dialer.fetchone()
+            self.assertIsNotNone(row)
+            # final_status
+            self.assertEqual(row[0], FINALIZED_NOCONTACT)
+            # schedule_aborted false (ya se procesó)
+            self.assertEqual(row[1], False)
+
+        # Restaurar el mock original para no afectar otros tests si fuera necesario
+        # (aunque en setUp se recrea gran parte, es buena práctica si es método de clase)
+        del AverageWorker.is_blacklisted 
+
+    def test_manual_call_blocks_blacklisted(self):
+        """Verifica que una llamada manual a un blacklisted sea rechazada"""
+        AverageWorker.is_blacklisted = MagicMock(return_value=True)
+        AverageWorker.attempt_contact_asterisk = MagicMock()
+
+        job_data = {
+            "id_campaign": 4,
+            "agent_id": 1,
+            "contact": [1, 4, "1234567890"]
+        }
+        job = GearmanJob(
+            None, None, b'manual-call',
+            bytes(str(uuid.uuid4()), encoding='utf8'),
+            self.encode_payload(job_data)
+        )
+
+        result = AverageWorker.manual_call(self.worker, job)
+
+        self.assertEqual(result, b"Error: Number is Blacklisted")
+        AverageWorker.attempt_contact_asterisk.assert_not_called()
+        del AverageWorker.is_blacklisted
+
+    def test_preview_call_blocks_blacklisted(self):
+        """Verifica que una llamada preview (call_campaign_contact) sea rechazada y limpiada"""
+        AverageWorker.is_blacklisted = MagicMock(return_value=True)
+        AverageWorker.attempt_contact_asterisk = MagicMock()
+
+        # Simulamos que el contacto está en estado SELECTED_CALL (15) listo para llamar
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE contact_in_campaign SET status = %s WHERE id_contact = 1",
+                (STATUS_SELECTED_CALL,)
+            )
+
+        job_data = {
+            "id_campaign": 4,
+            "agent_id": 1,
+            "id_contact": 1
+        }
+        job = GearmanJob(
+            None, None, b'call-campaign-contact',
+            bytes(str(uuid.uuid4()), encoding='utf8'),
+            self.encode_payload(job_data)
+        )
+
+        result = AverageWorker.call_campaign_contact(self.worker, job)
+
+        self.assertEqual(result, b"Aborted: Number is Blacklisted")
+        AverageWorker.attempt_contact_asterisk.assert_not_called()
+
+        # Verificar que el contacto fue devuelto a la cola (schedule_aborted=True)
+        # o finalizado, según la lógica que implementamos.
+        # En tu implementación pusimos 'schedule_aborted = true' para preview.
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT schedule_aborted FROM contact_in_campaign WHERE id_contact=1"
+            )
+            val = cur.fetchone()[0]
+            self.assertTrue(
+                val, "El contacto preview debió marcarse como schedule_aborted=True"
+            )
+
+        del AverageWorker.is_blacklisted
 
     def test_handle_campaign_general(self):
         process_campaign_cm = AverageWorker.process_campaign

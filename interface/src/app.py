@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-from flask import Flask, request, render_template
+from flask import Flask, request, render_template, jsonify
 
 from dialer.multichannel import GearmanDialer
 
@@ -34,9 +34,10 @@ DIALER = GearmanDialer
 @app.route('/create-campaign/<id_campaign>', methods=['POST'])
 def create_campaign(id_campaign):
     strategy = request.get_json().get('contact-strategy', [])
-    prefix = request.get_json().get('prefix', [])
+    prefix = request.get_json().get('prefix')
+    if prefix == []:
+        prefix = None
     return DIALER.create_campaign(id_campaign, strategy, prefix)
-
 
 @app.route('/edit-campaign/<id_campaign>', methods=['POST'])
 def edit_campaign(id_campaign):
@@ -142,9 +143,114 @@ def add_amd_event():
     data = request.get_json()
     return DIALER.add_amd_event(data)
 
+@app.route('/external-manual-call', methods=['POST'])
+def external_manual_call():
+    data = request.get_json(silent=True) or {}
+    phone_number = data.get("phone_number")
+    id_agent = data.get("id_agent")
+
+    if not phone_number:
+        return jsonify({"error": "phone_number is required"}), 400
+    if id_agent is None:
+        return jsonify({"error": "id_agent is required"}), 400
+
+    result = DIALER.external_manual_call(
+        phone_number=phone_number,
+        id_agent=id_agent,
+    )
+
+    return jsonify({
+        "status": "queued",
+        "id_agent": id_agent,
+        "phone_number": phone_number,
+        "job": result,
+    }), 202
+
+@app.route('/agent2agent', methods=['POST'])
+def agent2agent():
+    data = request.get_json(silent=True) or {}
+    id_agent_origen = data.get("id_agent_origen")
+    id_agent_destino = data.get("id_agent_destino")
+
+    if id_agent_origen is None:
+        return jsonify({"error": "id_agent_origen is required"}), 400
+    if id_agent_destino is None:
+        return jsonify({"error": "id_agent_destino is required"}), 400
+
+    result = DIALER.agent2agent_call(
+        id_agent_origen,
+        id_agent_destino
+    )
+
+    return jsonify({
+        "status": "queued",
+        "id_agent_origen": id_agent_origen,
+        "id_agent_destino": id_agent_destino,
+        "job": result,
+    }), 202
+
+@app.route('/manual-call/<int:id_campaign>', methods=['POST'])
+def manual_call(id_campaign):
+    data = request.get_json(silent=True) or {}
+    phone_number = data.get("phone_number")
+    id_contact = data.get("id_contact")
+    id_agent = data.get("id_agent")
+
+    if not phone_number:
+        return jsonify({"error": "phone_number is required"}), 400
+    if id_agent is None:
+        return jsonify({"error": "id_agent is required"}), 400
+
+    result = DIALER.manual_call(
+        id_campaign=id_campaign,
+        id_contact=id_contact,
+        phone_number=phone_number,
+        id_agent=id_agent,
+    )
+
+    return jsonify({
+        "status": "queued",
+        "id_campaign": id_campaign,
+        "id_contact": id_contact,
+        "id_agent": id_agent,
+        "phone_number": phone_number,
+        "job": result,
+    }), 202
+
+
+@app.route('/call-campaign-contact/<int:id_campaign>', methods=['POST'])
+def call_campaign_contact(id_campaign):
+    data = request.get_json(silent=True) or {}
+
+    id_contact = data.get("id_contact")
+    id_agent = data.get("id_agent")
+
+    force = bool(data.get("force", False))
+    ignore_opening_hours = bool(data.get("ignore_opening_hours", False))
+
+    if id_agent is None:
+        return jsonify({"error": "id_agent is required"}), 400
+
+    result = DIALER.call_campaign_contact(
+        id_campaign=id_campaign,
+        id_contact=id_contact,
+        id_agent=id_agent,
+        force=force,
+        ignore_opening_hours=ignore_opening_hours
+    )
+
+    return jsonify({
+        "status": "queued",
+        "id_campaign": id_campaign,
+        "id_contact": id_contact,
+        "id_agent": id_agent,
+        "force": force,
+        "ignore_opening_hours": ignore_opening_hours,
+        "job": result
+    }), 202
+
 
 # HTMX endpoints & UI related code
-
 app.jinja_env.globals['WEBSOCKET_SERVER'] = WEBSOCKET_SERVER
 
 

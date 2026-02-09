@@ -1,17 +1,10 @@
 # -*- coding: utf-8 -*-
 
-
 import gearman.client
-
-
 import json
-
-
+import gearman
 from .basic import Dialer
-
-
 from settings.default import GEARMAN_JOB_SERVERS
-
 
 class GearmanDialer(Dialer):
     """A dialer design to make multi-channel contacts using Gearman for horizontal scalability"""
@@ -34,9 +27,7 @@ class GearmanDialer(Dialer):
             'prefix': prefix
         }
         payload_bytes = cls.encode_payload(payload)
-        job_request = cls.GM_CLIENT.submit_job(
-            'create-campaign',
-            payload_bytes)
+        job_request = cls.GM_CLIENT.submit_job('create-campaign', payload_bytes)
         return cls.decode_payload(job_request.result)
 
     @classmethod
@@ -46,9 +37,7 @@ class GearmanDialer(Dialer):
             'contact_strategy': contact_strategy
         }
         payload_bytes = cls.encode_payload(payload)
-        job_request = cls.GM_CLIENT.submit_job(
-            'edit-campaign',
-            payload_bytes)
+        job_request = cls.GM_CLIENT.submit_job('edit-campaign', payload_bytes)
         return cls.decode_payload(job_request.result)
 
     @classmethod
@@ -200,3 +189,69 @@ class GearmanDialer(Dialer):
         payload_bytes = cls.encode_payload(payload)
         cls.GM_CLIENT.submit_job('add-incidence-rule-disposition', payload_bytes)
         return json.dumps({'msg': 'Disposition added'})
+
+    @classmethod
+    def manual_call(cls, id_campaign, phone_number, id_contact=None, id_agent=None):
+        payload = {
+            "id_campaign": int(id_campaign),
+            "id_contact": int(id_contact) if id_contact is not None else None,
+            "id_agent": int(id_agent) if id_agent is not None else 0,
+            "phone_number": str(phone_number)
+        }
+        cls.GM_CLIENT.submit_job(
+            "manual-call",
+            cls.encode_payload(payload),
+            background=True
+        )
+        return {"queued": True}
+
+    @classmethod
+    def call_campaign_contact(
+        cls, id_campaign, id_agent, id_contact=None, force=False, ignore_opening_hours=False
+    ):
+        payload = {
+            "id_campaign": int(id_campaign),
+            "id_contact": int(id_contact) if id_contact is not None else None,
+            "id_agent": int(id_agent) if id_agent is not None else 0,
+            "force": bool(force),
+            "ignore_opening_hours": bool(ignore_opening_hours),
+        }
+        cls.GM_CLIENT.submit_job(
+            "call-campaign-contact",
+            cls.encode_payload(payload),
+            background=True
+        )
+        return {"queued": True}
+
+    @classmethod
+    def external_manual_call(cls, phone_number, id_agent):
+        """
+        NUEVO MÉTODO: Envía una llamada libre al Worker.
+        """
+        payload = {
+            "phone_number": str(phone_number),
+            "id_agent": int(id_agent) if id_agent is not None else 0
+        }
+        cls.GM_CLIENT.submit_job(
+            "external-manual-call",
+            cls.encode_payload(payload),
+            background=True
+        )
+        return {"queued": True}
+
+    @classmethod
+    def agent2agent_call(cls, id_agent_origen, id_agent_destino):
+        """
+        Envía una llamada agent2agent al Worker.
+        Conecta dos agentes directamente sin campaña.
+        """
+        payload = {
+            "id_agent_origen": int(id_agent_origen) if id_agent_origen is not None else 0,
+            "id_agent_destino": int(id_agent_destino) if id_agent_destino is not None else 0
+        }
+        cls.GM_CLIENT.submit_job(
+            "agent2agent-call",
+            cls.encode_payload(payload),
+            background=True
+        )
+        return {"queued": True}
