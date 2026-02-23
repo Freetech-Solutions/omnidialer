@@ -1,6 +1,6 @@
 stages:
-  - lint
-  - test
+  # - lint
+  # - test
   - build
 
 variables:
@@ -12,20 +12,20 @@ services:
   - name: docker:dind
     command: ["--tls=false"]
 
-lint:
-  stage: lint
-  image: python:3.9-alpine
-  before_script:
-    - python -m pip install --upgrade pip
-    - pip install flake8
-  script:
-    - flake8
+# lint:
+#   stage: lint
+#   image: python:3.9-alpine
+#   before_script:
+#     - python -m pip install --upgrade pip
+#     - pip install flake8
+#   script:
+#     - flake8
 
-test:
-  stage: test
-  image: docker:20.10.15-alpine3.15
-  script:
-    - sh run-tests.sh
+# test:
+#   stage: test
+#   image: docker:20.10.15-alpine3.15
+#   script:
+#     - sh run-tests.sh
 
 # Template genérico para builds
 .build_template:

@@ -99,8 +99,6 @@ signal.signal(signal.SIGTERM, _sched_sig_handler)
 signal.signal(signal.SIGINT, _sched_sig_handler)
 
 
-WEBRTC_TRUNK = os.getenv('WEBRTC_TRUNK', 'webrtc-trunk')
-
 REDIS_OML_SERVER = os.getenv('REDIS_OML_SERVER', 'oml-redis')
 
 REDIS_OML_PORT = os.getenv('REDIS_OML_PORT', '6379')
@@ -171,6 +169,7 @@ STATUS_TIMEOUT = 5
 STATUS_CHANUNAVAIL = 8
 STATUS_INVALID_NUMBER = 9
 STATUS_AMD_MACHINE = 10  # AMD declaró MACHINE (contestador); entidad propia para métricas
+STATUS_SHORTCALL = 11  # contestó y colgó en <5s; entidad propia para métricas
 
 NAME_TO_STATUS = {
     "CHANUNAVAIL": STATUS_CHANUNAVAIL,
@@ -184,6 +183,7 @@ NAME_TO_STATUS = {
     "TIMEOUT": STATUS_TIMEOUT,
     "CANCEL": STATUS_TERMINATED,  # llamada cancelada antes de contestar; sin reglas de incidencia
     "AMD": STATUS_AMD_MACHINE,  # contestador detectado; entidad propia en history y métricas
+    "EXIT_SHORTCALL": STATUS_SHORTCALL,  # contestó y colgó en <5s; sin reglas de incidencia
 }
 
 # mapeo código -> nombre para interpretar history y métricas
@@ -198,6 +198,7 @@ STATUS_TO_NAME = {
     STATUS_CHANUNAVAIL: "CHANUNAVAIL",
     STATUS_INVALID_NUMBER: "INVALID_NUMBER",
     STATUS_AMD_MACHINE: "AMD",  # AMD Detected / Contestador
+    STATUS_SHORTCALL: "EXIT_SHORTCALL",
 }
 
 # contact final status
@@ -225,10 +226,10 @@ DISPOSITION_TYPE = 2
 
 # fail statuses
 # TODO: incorporate the names of the other fail events
-FAIL_EVENTS = ['BUSY', 'NOANSWER', 'CONGESTION', 'TIMEOUT', 'TERMINATED', 'CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'AMD']
+FAIL_EVENTS = ['BUSY', 'NOANSWER', 'CONGESTION', 'TIMEOUT', 'TERMINATED', 'CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'AMD', 'EXIT_SHORTCALL']
 
 # fail statuses with no incidence rules
-FAIL_NO_RULES_EVENTS = ['CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'AMD']
+FAIL_NO_RULES_EVENTS = ['CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'AMD', 'EXIT_SHORTCALL']
 
 # incidence rules multinum behauviour
 FIXED = 1
@@ -687,6 +688,7 @@ class AverageWorker(DialerWorker):
                                 if current > campaign_max:
                                     # Si nos pasamos, devolvemos el cupo y abortamos este contacto
                                     cls.REDIS_DIALER_CONNECTION.decrby(key_calls, 1)
+                                    cls._publish_calls_count(id_campaign)
                                     logger.warning(
                                         f"Campaign {id_campaign}: Exceeded max channels "
                                         f"({current} > {campaign_max}). Skipping contact {contact[0]}"
@@ -701,6 +703,7 @@ class AverageWorker(DialerWorker):
                                 
                                 # Si la reserva fue exitosa, enviamos a Gearman
                                 cls.attempt_contact(contact, id_campaign)
+                                cls._publish_calls_count(id_campaign)
                                 caps_calls_counter += 1
                                 break
                             else:
@@ -1415,6 +1418,31 @@ class AverageWorker(DialerWorker):
         return n
 
     @classmethod
+    def _publish_calls_count(cls, id_campaign: int) -> None:
+        """
+        Publica el valor actual de OML:CALLS:{id_campaign}:DIALER en OML:CHANNEL:DIALER
+        para que la supervisión actualice "Canales discando" en tiempo real.
+        """
+        try:
+            cls.connect_redis_dialer()
+            key = f'OML:CALLS:{id_campaign}:DIALER'
+            val = cls.REDIS_DIALER_CONNECTION.get(key)
+            if val is None:
+                count = 0
+            else:
+                try:
+                    count = int(val)
+                except (TypeError, ValueError):
+                    count = 0
+            cls.connect_redis_oml()
+            cls.REDIS_OML_CONNECTION.publish(
+                'OML:CHANNEL:DIALER',
+                json.dumps({'type': 'CALLS', 'camp_id': id_campaign, 'calls': count})
+            )
+        except Exception as e:
+            logger.debug('Publish CALLS count failed camp %s: %s', id_campaign, e)
+
+    @classmethod
     @timed_lru_cache(seconds=600, maxsize=128)
     def get_campaign_max_available_channels(cls, id_campaign):
         with cls.get_dialer_connection() as conn_dialer:
@@ -1703,6 +1731,7 @@ class AverageWorker(DialerWorker):
             cls.connect_redis_dialer()
             key_calls = f'OML:CALLS:{id_campaign}:DIALER'
             cls.REDIS_DIALER_CONNECTION.decrby(key_calls, 1)
+            cls._publish_calls_count(id_campaign)
             
             # Actualizamos Redis para estadísticas
             cls.REDIS_DIALER_CONNECTION.hset(
@@ -1756,6 +1785,7 @@ class AverageWorker(DialerWorker):
                                     f"Redis counter went negative for campaign {id_campaign}, "
                                     f"reset to 0"
                                 )
+                            cls._publish_calls_count(id_campaign)
                         except Exception as redis_error:
                             logger.error(
                                 f"Error during rollback of Redis counter: {redis_error}"
@@ -1773,6 +1803,7 @@ class AverageWorker(DialerWorker):
                     cls.connect_redis_dialer()
                     key_calls = f'OML:CALLS:{id_campaign}:DIALER'
                     cls.REDIS_DIALER_CONNECTION.decrby(key_calls, 1)
+                    cls._publish_calls_count(id_campaign)
                     
                     # Marcamos para reintento
                     cursor_dialer.execute(
@@ -1785,6 +1816,7 @@ class AverageWorker(DialerWorker):
                 cls.connect_redis_dialer()
                 key_calls = f'OML:CALLS:{id_campaign}:DIALER'
                 cls.REDIS_DIALER_CONNECTION.decrby(key_calls, 1)
+                cls._publish_calls_count(id_campaign)
                 
                 # Marcamos para reintento
                 cursor_dialer.execute(
@@ -2001,28 +2033,30 @@ class AverageWorker(DialerWorker):
         call_type = ari_event_data.get('call_type', '')
         dialstatus = ari_event_data.get('dialstatus', '')
         dialstring = ari_event_data.get('dialstring', '')
+        callid = ari_event_data.get('callid') or ari_event_data.get('uniqueid') or ''
 
         try:
             id_campaign, contact_id, phone_number = cls.get_contact_data(ari_event_data)
         except (KeyError, TypeError, ValueError) as e:
             logger.warning(
-                "process_event: no se pudo extraer contact_data del payload | type=%s call_type=%s "
+                "process_event [%s]: payload sin campos explícitos de negocio (id_campaign/contact_id/phone_number) | type=%s call_type=%s "
                 "error=%s payload_keys=%s",
-                event_type, call_type, e, list(ari_event_data.keys()) if ari_event_data else [],
+                callid, event_type, call_type, e, list(ari_event_data.keys()) if ari_event_data else [],
             )
             raise
 
         logger.info(
-            "process_event: recibido | campaign=%s contact=%s phone=%s type=%s call_type=%s "
+            "process_event [%s]: recibido | campaign=%s contact=%s phone=%s type=%s call_type=%s "
             "dialstatus=%s dialstring=%s",
-            id_campaign, contact_id, phone_number, event_type, call_type, dialstatus, dialstring,
+            callid, id_campaign, contact_id, phone_number, event_type, call_type, dialstatus, dialstring,
         )
 
         # ----- RouteValidationFailed (llamada bloqueada por validación de ruta): decrementar -----
         if event_type == 'RouteValidationFailed':
             if int(id_campaign or 0) == 0:
                 logger.debug(
-                    "process_event: RouteValidationFailed ignorado (campaña 0)",
+                    "process_event [%s]: RouteValidationFailed ignorado (campaña 0)",
+                    callid,
                 )
                 return b'Event was processed'
             cls.connect_redis_dialer()
@@ -2035,6 +2069,7 @@ class AverageWorker(DialerWorker):
                         "Campaign %s: call count went negative on RouteValidationFailed, reset to 0",
                         id_campaign,
                     )
+                cls._publish_calls_count(id_campaign)
             except Exception as e:
                 logger.error(
                     "Campaign %s: error decrementing call count on RouteValidationFailed: %s",
@@ -2043,8 +2078,8 @@ class AverageWorker(DialerWorker):
                 )
             cls.GM_CLIENT.submit_job('send-reports', job.data, background=True)
             logger.info(
-                "process_event: RouteValidationFailed, decrement | campaign=%s contact=%s phone=%s",
-                id_campaign, contact_id, phone_number,
+                "process_event [%s]: RouteValidationFailed, decrement | campaign=%s contact=%s phone=%s",
+                callid, id_campaign, contact_id, phone_number,
             )
             return b'Event was processed'
 
@@ -2061,6 +2096,7 @@ class AverageWorker(DialerWorker):
                             "Campaign %s: call count went negative on ChannelDestroyed, reset to 0",
                             id_campaign,
                         )
+                    cls._publish_calls_count(id_campaign)
                 except Exception as e:
                     logger.error(
                         "Campaign %s: error decrementing call count on ChannelDestroyed: %s",
@@ -2069,26 +2105,26 @@ class AverageWorker(DialerWorker):
                     )
                 cls.GM_CLIENT.submit_job('send-reports', job.data, background=True)
                 logger.debug(
-                    "process_event: ChannelDestroyed to_pstn, decrement y send-reports | campaign=%s",
-                    id_campaign,
+                    "process_event [%s]: ChannelDestroyed to_pstn, decrement y send-reports | campaign=%s",
+                    callid, id_campaign,
                 )
             else:
                 logger.debug(
-                    "process_event: ChannelDestroyed ignorado (call_type=%s o campaña 0)",
-                    call_type,
+                    "process_event [%s]: ChannelDestroyed ignorado (call_type=%s o campaña 0)",
+                    callid, call_type,
                 )
             return b'Event was processed'
 
         # ----- Dial: solo eventos terminales (ANSWER o fallo); intermedios (vacío, RINGING) se ignoran -----
         if event_type != 'Dial':
-            logger.debug("process_event: tipo %s no manejado, omitiendo", event_type)
+            logger.debug("process_event [%s]: tipo %s no manejado, omitiendo", callid, event_type)
             return b'Event was processed'
 
         # Intermedios: no actualizar estado ni enviar send-reports
         if dialstatus in ('', 'RINGING') or dialstatus is None:
             logger.debug(
-                "process_event: Dial intermedio (dialstatus=%r), sin actualizar estado ni send-reports",
-                dialstatus,
+                "process_event [%s]: Dial intermedio (dialstatus=%r), sin actualizar estado ni send-reports",
+                callid, dialstatus,
             )
             return b'Event was processed'
 
@@ -2096,15 +2132,15 @@ class AverageWorker(DialerWorker):
             if cls.is_answered_pstn(ari_event_data):
                 status = "ANSWERED_PSTN"
                 logger.info(
-                    "process_event: ANSWERED_PSTN (troncal) | campaign=%s contact=%s phone=%s",
-                    id_campaign, contact_id, phone_number,
+                    "process_event [%s]: ANSWERED_PSTN (troncal) | campaign=%s contact=%s phone=%s",
+                    callid, id_campaign, contact_id, phone_number,
                 )
                 cls.set_contact_status(id_campaign, contact_id, status)
             elif cls.is_answered_agent(ari_event_data):
                 status = "ANSWERED_AGENT"
                 logger.info(
-                    "process_event: ANSWERED_AGENT (cola) | campaign=%s contact=%s phone=%s",
-                    id_campaign, contact_id, phone_number,
+                    "process_event [%s]: ANSWERED_AGENT (cola) | campaign=%s contact=%s phone=%s",
+                    callid, id_campaign, contact_id, phone_number,
                 )
                 cls.set_contact_status(id_campaign, contact_id, status)
                 cls.connect_redis_dialer()
@@ -2116,19 +2152,19 @@ class AverageWorker(DialerWorker):
                     cls.REDIS_DIALER_CONNECTION.hset(
                         f'CONTACT:{contact_id}:CAMP:{id_campaign}', 'STATUS', FINALIZED_SUCCESS)
                 logger.info(
-                    "process_event: contacto finalizado con éxito | campaign=%s contact=%s phone=%s",
-                    id_campaign, contact_id, phone_number,
+                    "process_event [%s]: contacto finalizado con éxito | campaign=%s contact=%s phone=%s",
+                    callid, id_campaign, contact_id, phone_number,
                 )
         elif cls.is_fail_event(ari_event_data):
             fail_status = cls.decode_fail_event(ari_event_data)
             logger.info(
-                "process_event: evento fallo (Dial) | campaign=%s contact=%s phone=%s dialstatus=%s "
+                "process_event [%s]: evento fallo (Dial) | campaign=%s contact=%s phone=%s dialstatus=%s "
                 "decoded=%s",
-                id_campaign, contact_id, phone_number, dialstatus, fail_status,
+                callid, id_campaign, contact_id, phone_number, dialstatus, fail_status,
             )
             cls.handle_fail_event(ari_event_data, id_campaign, contact_id, phone_number)
-            # CANCEL/AMD: decrement aquí (ari-app no envía ChannelDestroyed para CANCEL ni para AMD MACHINE)
-            if dialstatus in ('CANCEL', 'AMD') and int(id_campaign or 0) != 0:
+            # CANCEL/AMD/EXIT_SHORTCALL: decrement aquí (ari-app no envía ChannelDestroyed para estos)
+            if dialstatus in ('CANCEL', 'AMD', 'EXIT_SHORTCALL') and int(id_campaign or 0) != 0:
                 cls.connect_redis_dialer()
                 key_calls = f'OML:CALLS:{id_campaign}:DIALER'
                 try:
@@ -2139,6 +2175,7 @@ class AverageWorker(DialerWorker):
                             "Campaign %s: call count went negative on Dial %s, reset to 0",
                             id_campaign, dialstatus,
                         )
+                    cls._publish_calls_count(id_campaign)
                 except Exception as e:
                     logger.error(
                         "Campaign %s: error decrementing call count on Dial %s: %s",
@@ -2146,19 +2183,19 @@ class AverageWorker(DialerWorker):
                         exc_info=True,
                     )
                 logger.debug(
-                    "process_event: Dial %s, decrement | campaign=%s",
-                    dialstatus, id_campaign,
+                    "process_event [%s]: Dial %s, decrement | campaign=%s",
+                    callid, dialstatus, id_campaign,
                 )
         else:
             logger.debug(
-                "process_event: Dial no answer ni fail (ignorado) | campaign=%s contact=%s dialstatus=%s",
-                id_campaign, contact_id, dialstatus,
+                "process_event [%s]: Dial no answer ni fail (ignorado) | campaign=%s contact=%s dialstatus=%s",
+                callid, id_campaign, contact_id, dialstatus,
             )
 
         cls.GM_CLIENT.submit_job('send-reports', job.data, background=True)
         logger.debug(
-            "process_event: finalizado, job send-reports enviado | campaign=%s contact=%s",
-            id_campaign, contact_id,
+            "process_event [%s]: finalizado, job send-reports enviado | campaign=%s contact=%s",
+            callid, id_campaign, contact_id,
         )
         return b'Event was processed'
 
@@ -2197,20 +2234,29 @@ class AverageWorker(DialerWorker):
     @classmethod
     def get_contact_data(cls, ari_event_data):
         """
-        Extrae id_campaign, contact_id y phone_number del payload del evento.
-        Compatible con eventos Dial (ARI) y ChannelDestroyed (ACD construye peer.caller.name
-        con formato id_camp_id_contact_phone).
+        Extrae id_campaign, contact_id y phone_number desde campos explícitos del payload.
+
+        Contrato requerido:
+        - id_campaign
+        - contact_id
+        - phone_number
         """
-        peer = ari_event_data.get('peer') or {}
-        caller = peer.get('caller') if isinstance(peer, dict) else {}
-        name = caller.get('name') if isinstance(caller, dict) else None
-        if not name:
-            raise KeyError('peer.caller.name')
-        parts = name.split('_')
-        if len(parts) < 3:
-            raise ValueError(f'peer.caller.name debe tener al menos 3 segmentos: {name!r}')
-        phone = '_'.join(parts[2:]) if len(parts) > 2 else ''
-        return parts[0], parts[1], phone
+        required_fields = ('id_campaign', 'contact_id', 'phone_number')
+        missing_fields = [field for field in required_fields if field not in ari_event_data]
+        if missing_fields:
+            raise KeyError(f"Missing required fields: {missing_fields}")
+
+        id_campaign = ari_event_data.get('id_campaign')
+        contact_id = ari_event_data.get('contact_id')
+        phone_number = ari_event_data.get('phone_number')
+
+        if id_campaign in (None, "") or contact_id in (None, "") or phone_number in (None, ""):
+            raise ValueError(
+                "Invalid empty values in required fields: "
+                f"id_campaign={id_campaign!r}, contact_id={contact_id!r}, phone_number={phone_number!r}"
+            )
+
+        return str(id_campaign), str(contact_id), str(phone_number)
 
     @classmethod
     def is_answered_pstn(cls, ari_event_data):

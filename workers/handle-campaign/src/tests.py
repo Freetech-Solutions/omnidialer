@@ -149,6 +149,9 @@ class MyTestSuite(unittest.TestCase):
     def gen_fail_event(self, event):
         return {'type': 'Dial',
                 'timestamp': '2025-04-15T11:21:29.168-0300',
+                'id_campaign': '4',
+                'contact_id': '1',
+                'phone_number': '6093017590',
                 'dialstatus': event,
                 'forward': '',
                 'dialstring': '123456720@pstn_gateway',
@@ -167,6 +170,24 @@ class MyTestSuite(unittest.TestCase):
                          'creationtime': '2025-04-15T11:21:25.125-0300',
                          'language': 'en'},
                 'asterisk_id': '26:ce:a5:36:bc:0a', 'application': 'call_manager_dialer'}
+
+    def test_get_contact_data_reads_explicit_fields(self):
+        event = {
+            "id_campaign": "4",
+            "contact_id": "1",
+            "phone_number": "6093017590",
+        }
+        self.assertEqual(
+            AverageWorker.get_contact_data(event),
+            ("4", "1", "6093017590"),
+        )
+
+    def test_get_contact_data_missing_fields_raises(self):
+        event = {
+            "peer": {"caller": {"name": "4_1_6093017590"}}
+        }
+        with self.assertRaises(KeyError):
+            AverageWorker.get_contact_data(event)
 
     def test_chanunavailable_events(self):
         # make sure if an chanunavailable event came to process event a call won't be scheduled
@@ -189,6 +210,15 @@ class MyTestSuite(unittest.TestCase):
         # check that a job was submitted to 'schedule-contact'
         self.assertEqual(AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][0],
                          'schedule-agenda')
+
+    def test_process_event_missing_explicit_fields_fails_fast(self):
+        AverageWorker.GM_CLIENT.submit_job = MagicMock()
+        busy_event = self.gen_fail_event('BUSY')
+        busy_event.pop('id_campaign')
+        job = GearmanJob(None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+                         bytes(json.dumps(busy_event), encoding="UTF8"))
+        with self.assertRaises(KeyError):
+            AverageWorker.process_event(self.worker, job)
 
     def test_incidence_rules_disposition(self):
         # make sure if a disposition came to the disposition endpoint and there is an incidence rule
