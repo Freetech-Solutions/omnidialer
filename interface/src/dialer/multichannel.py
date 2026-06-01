@@ -3,14 +3,15 @@
 
 import gearman.client
 
-
 import json
-
+import logging
 
 from .basic import Dialer
 
-
 from settings.default import GEARMAN_JOB_SERVERS
+
+
+logger = logging.getLogger(__name__)
 
 
 class GearmanDialer(Dialer):
@@ -27,6 +28,27 @@ class GearmanDialer(Dialer):
         return data.decode(encoding="utf8")
 
     @classmethod
+    def decode_job_response(cls, job_request, task_name):
+        if job_request.result is None:
+            logger.error(
+                "Gearman job '%s' returned no result. state=%s timed_out=%s exception=%r",
+                task_name,
+                job_request.state,
+                job_request.timed_out,
+                job_request.exception,
+            )
+            if job_request.exception:
+                # raise RuntimeError(
+                msg = f"Gearman job '{task_name}' failed: {job_request.exception}"
+            if job_request.timed_out:
+                # raise TimeoutError(
+                msg = f"Gearman job '{task_name}' timed out"
+            # raise RuntimeError(
+                msg = f"Gearman job '{task_name}' returned no result (state={job_request.state})"
+            return {'gearman_error': msg}
+        return cls.decode_payload(job_request.result)
+
+    @classmethod
     def create_campaign(cls, id_campaign, contact_strategy, prefix):
         payload = {
             'id_campaign': id_campaign,
@@ -37,7 +59,7 @@ class GearmanDialer(Dialer):
         job_request = cls.GM_CLIENT.submit_job(
             'create-campaign',
             payload_bytes)
-        return cls.decode_payload(job_request.result)
+        return cls.decode_job_response(job_request, 'create-campaign')
 
     @classmethod
     def edit_campaign(cls, id_campaign, contact_strategy):
@@ -49,7 +71,7 @@ class GearmanDialer(Dialer):
         job_request = cls.GM_CLIENT.submit_job(
             'edit-campaign',
             payload_bytes)
-        return cls.decode_payload(job_request.result)
+        return cls.decode_job_response(job_request, 'edit-campaign')
 
     @classmethod
     def start_campaign(cls, id_campaign, sync_omnileads=False):
@@ -186,12 +208,12 @@ class GearmanDialer(Dialer):
         payload = {'action': action}
         payload_bytes = cls.encode_payload(payload)
         job_request = cls.GM_CLIENT.submit_job('manage-dialer', payload_bytes)
-        return cls.decode_payload(job_request.result)
+        return cls.decode_job_response(job_request, 'manage-dialer')
 
     @classmethod
     def render_template(cls, data):
         job_request = cls.GM_CLIENT.submit_job('render-template', cls.encode_payload(data))
-        return cls.decode_payload(job_request.result)
+        return cls.decode_job_response(job_request, 'render-template')
 
     @classmethod
     def add_amd_event(cls, data):
