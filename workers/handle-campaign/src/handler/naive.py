@@ -239,6 +239,11 @@ JOB_STARTED = 1
 JOB_FAILED = 2
 
 
+class CampaignNotFoundError(Exception):
+    """Raised when a campaign is expected to exist in the dialer database but does not."""
+    pass
+
+
 def job_handler_decorator(method):
     def wrapper(*args, **kwargs):
         worker_class = args[0]
@@ -1178,7 +1183,11 @@ class AverageWorker(DialerWorker):
     def get_campaign_status(cls, id_campaign, dialer_cursor):
         dialer_cursor.execute(
             'SELECT dialer_status FROM ONLY campaign WHERE id = %s', (id_campaign,))
-        return dialer_cursor.fetchone()[0]
+        row = dialer_cursor.fetchone()
+        if row is None:
+            raise CampaignNotFoundError(
+                f'Campaign {id_campaign} does not exist in the dialer database')
+        return row[0]
 
     @classmethod
     def all_contacts_were_attempted(cls, id_campaign):

@@ -2,7 +2,7 @@
 
 from flask import Flask, request, render_template, jsonify
 
-from dialer.multichannel import GearmanDialer
+from dialer.multichannel import GearmanDialer, DialerJobError
 
 from settings.default import WEBSOCKET_SERVER
 
@@ -26,6 +26,17 @@ def _normalize_sync_omnileads(value):
 app = Flask(__name__)
 
 DIALER = GearmanDialer
+
+
+@app.errorhandler(DialerJobError)
+def handle_dialer_job_error(error):
+    """Return a clear error response when a dialer worker job fails.
+
+    Avoids the opaque HTTP 500 caused by decoding a None result and surfaces
+    the failure as a 502 (the upstream worker failed). The root cause is
+    available in the handle-campaign worker logs.
+    """
+    return jsonify({'error': str(error)}), 502
 
 # TODO: pass a parameter called 'type' for dispatch to
 # the class linked to that kind of a campaing (voip, email, Whatsapp, Telegram, SMS, etc)

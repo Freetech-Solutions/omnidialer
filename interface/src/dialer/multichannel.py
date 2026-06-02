@@ -6,6 +6,12 @@ import gearman
 from .basic import Dialer
 from settings.default import GEARMAN_JOB_SERVERS
 
+
+class DialerJobError(Exception):
+    """Raised when a synchronous Gearman job fails, times out or returns no result."""
+    pass
+
+
 class GearmanDialer(Dialer):
     """A dialer design to make multi-channel contacts using Gearman for horizontal scalability"""
 
@@ -20,6 +26,24 @@ class GearmanDialer(Dialer):
         return data.decode(encoding="utf8")
 
     @classmethod
+    def submit_sync_job(cls, task, payload_bytes):
+        """Submit a foreground job and return its decoded result.
+
+        Raises DialerJobError when the worker fails or times out, instead of
+        blindly decoding a None result (which would raise an opaque
+        AttributeError). The descriptive cause is logged by the worker itself.
+        """
+        job_request = cls.GM_CLIENT.submit_job(task, payload_bytes)
+        if job_request.timed_out:
+            raise DialerJobError(f"The '{task}' job timed out in the dialer worker")
+        if job_request.state != gearman.JOB_COMPLETE or job_request.result is None:
+            raise DialerJobError(
+                f"The '{task}' job failed in the dialer worker. "
+                "Check the handle-campaign worker logs for details."
+            )
+        return cls.decode_payload(job_request.result)
+
+    @classmethod
     def create_campaign(cls, id_campaign, contact_strategy, prefix):
         payload = {
             'id_campaign': id_campaign,
@@ -27,8 +51,7 @@ class GearmanDialer(Dialer):
             'prefix': prefix
         }
         payload_bytes = cls.encode_payload(payload)
-        job_request = cls.GM_CLIENT.submit_job('create-campaign', payload_bytes)
-        return cls.decode_payload(job_request.result)
+        return cls.submit_sync_job('create-campaign', payload_bytes)
 
     @classmethod
     def edit_campaign(cls, id_campaign, contact_strategy):
@@ -37,8 +60,7 @@ class GearmanDialer(Dialer):
             'contact_strategy': contact_strategy
         }
         payload_bytes = cls.encode_payload(payload)
-        job_request = cls.GM_CLIENT.submit_job('edit-campaign', payload_bytes)
-        return cls.decode_payload(job_request.result)
+        return cls.submit_sync_job('edit-campaign', payload_bytes)
 
     @classmethod
     def start_campaign(cls, id_campaign, sync_omnileads=False):
@@ -174,13 +196,11 @@ class GearmanDialer(Dialer):
     def manage_dialer(cls, action):
         payload = {'action': action}
         payload_bytes = cls.encode_payload(payload)
-        job_request = cls.GM_CLIENT.submit_job('manage-dialer', payload_bytes)
-        return cls.decode_payload(job_request.result)
+        return cls.submit_sync_job('manage-dialer', payload_bytes)
 
     @classmethod
     def render_template(cls, data):
-        job_request = cls.GM_CLIENT.submit_job('render-template', cls.encode_payload(data))
-        return cls.decode_payload(job_request.result)
+        return cls.submit_sync_job('render-template', cls.encode_payload(data))
 
     @classmethod
     def add_amd_event(cls, data):
