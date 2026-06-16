@@ -18,3 +18,5 @@ if not GEARMAN_JOBS:
     logger.warning('GEARMAN_JOBS is not configured; no Gearman jobs available.')
 
 TIME_BETWEEN_CALLS = os.getenv('TIME_BETWEEN_CALLS')
+
+CHANNEL_AUDIT_INTERVAL_SEC = int(os.getenv('DIALER_CHANNEL_AUDIT_INTERVAL_SEC', '60'))

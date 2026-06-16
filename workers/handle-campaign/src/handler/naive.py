@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Flag global para registrar listener una sola vez
 _SCHED_LISTENER_REGISTERED = False
+_AUDIT_JOB_REGISTERED = False
 # Flag global para shutdown ordenado
 _SCHED_SHUTDOWN_DONE = False
 
@@ -226,10 +227,10 @@ DISPOSITION_TYPE = 2
 
 # fail statuses
 # TODO: incorporate the names of the other fail events
-FAIL_EVENTS = ['BUSY', 'NOANSWER', 'CONGESTION', 'TIMEOUT', 'TERMINATED', 'CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'AMD', 'EXIT_SHORTCALL']
+FAIL_EVENTS = ['BUSY', 'NOANSWER', 'CONGESTION', 'TIMEOUT', 'TERMINATED', 'CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'AMD', 'EXIT_SHORTCALL', 'ORIGINATE_FAILED']
 
 # fail statuses with no incidence rules
-FAIL_NO_RULES_EVENTS = ['CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'AMD', 'EXIT_SHORTCALL']
+FAIL_NO_RULES_EVENTS = ['CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'AMD', 'EXIT_SHORTCALL', 'ORIGINATE_FAILED']
 
 # incidence rules multinum behauviour
 FIXED = 1
@@ -237,6 +238,13 @@ MULT = 2
 
 JOB_STARTED = 1
 JOB_FAILED = 2
+
+CALLS_DECR_DEDUP_TTL_SEC = int(os.getenv('DIALER_CALLS_DECR_DEDUP_TTL_SEC', '3600'))
+RESERVE_GRACE_SEC = int(os.getenv('DIALER_RESERVE_GRACE_SEC', '30'))
+CHANNEL_AUDIT_INTERVAL_SEC = int(os.getenv('DIALER_CHANNEL_AUDIT_INTERVAL_SEC', '60'))
+
+# Dial statuses que liberan reserva OML:CALLS (sin esperar ChannelDestroyed)
+CALLS_DECR_DIAL_STATUSES = ('CANCEL', 'AMD', 'EXIT_SHORTCALL', 'ORIGINATE_FAILED')
 
 
 class CampaignNotFoundError(Exception):
@@ -688,6 +696,15 @@ class AverageWorker(DialerWorker):
                                 # --- RESERVA INMEDIATA EN EL LOOP ---
                                 # Incrementamos ANTES de mandar a Gearman para evitar el lag
                                 current = cls.REDIS_DIALER_CONNECTION.incrby(key_calls, 1)
+
+                                reserve_ts_key = (
+                                    f'OML:CALLS:RESERVE_TS:{id_campaign}:{contact[0]}'
+                                )
+                                cls.REDIS_DIALER_CONNECTION.set(
+                                    reserve_ts_key,
+                                    str(int(time.time())),
+                                    ex=max(RESERVE_GRACE_SEC * 4, 120),
+                                )
                                 
                                 # Verificación de seguridad (Double Check)
                                 if current > campaign_max:
@@ -1288,6 +1305,9 @@ class AverageWorker(DialerWorker):
                cls.no_active_incidence_rules(id_campaign) and \
                cls.no_active_agendas(id_campaign):
                 logger.debug(f'Campaign {id_campaign}: no more contacts pending for call')
+                cls.reset_dialer_calls_counter(
+                    id_campaign, reason='auto_finalize_contacts_consumed',
+                )
                 cls.set_campaign_status(id_campaign, FINALIZED, sync_omnileads=True)
                 cls.connect_redis_oml()
                 cls.REDIS_OML_CONNECTION.publish(
@@ -1450,6 +1470,125 @@ class AverageWorker(DialerWorker):
             )
         except Exception as e:
             logger.debug('Publish CALLS count failed camp %s: %s', id_campaign, e)
+
+    @classmethod
+    def _calls_decr_dedup_key(cls, id_campaign, contact_id, callid):
+        safe_callid = callid or f"{id_campaign}:{contact_id}"
+        return f'OML:CALLS:DECR:{id_campaign}:{contact_id}:{safe_callid}'
+
+    @classmethod
+    def _decrement_calls_once(cls, id_campaign, contact_id, callid, context='', use_dedup=True):
+        """Decrementa OML:CALLS; con dedup evita doble DECR por eventos duplicados."""
+        if int(id_campaign or 0) == 0:
+            return False
+        cls.connect_redis_dialer()
+        if use_dedup:
+            dedup_callid = callid or f"{id_campaign}:{contact_id}:{int(time.time() * 1000)}"
+            dedup_key = cls._calls_decr_dedup_key(id_campaign, contact_id, dedup_callid)
+            if not cls.REDIS_DIALER_CONNECTION.set(
+                dedup_key, '1', nx=True, ex=CALLS_DECR_DEDUP_TTL_SEC
+            ):
+                logger.debug(
+                    'Skip duplicate decrement camp=%s contact=%s callid=%s ctx=%s',
+                    id_campaign, contact_id, callid, context,
+                )
+                return False
+        key_calls = f'OML:CALLS:{id_campaign}:DIALER'
+        try:
+            val = cls.REDIS_DIALER_CONNECTION.decr(key_calls)
+            if val < 0:
+                cls.REDIS_DIALER_CONNECTION.set(key_calls, 0)
+                logger.warning(
+                    'Campaign %s: call count went negative on %s, reset to 0',
+                    id_campaign, context,
+                )
+            cls._publish_calls_count(id_campaign)
+            return True
+        except Exception as e:
+            logger.error(
+                'Campaign %s: error decrementing call count on %s: %s',
+                id_campaign, context, e,
+                exc_info=True,
+            )
+            return False
+
+    @classmethod
+    def reset_dialer_calls_counter(cls, id_campaign, reason=''):
+        """Reset defensivo de OML:CALLS al finalizar campaña."""
+        if int(id_campaign or 0) == 0:
+            return
+        cls.connect_redis_dialer()
+        key_calls = f'OML:CALLS:{id_campaign}:DIALER'
+        val = cls.REDIS_DIALER_CONNECTION.get(key_calls)
+        try:
+            prev = int(val or 0)
+        except (TypeError, ValueError):
+            prev = 0
+        if prev > 0:
+            logger.warning(
+                'Campaign %s: resetting OML:CALLS from %s to 0 (%s)',
+                id_campaign, prev, reason,
+            )
+            cls.REDIS_DIALER_CONNECTION.set(key_calls, 0)
+            cls._publish_calls_count(id_campaign)
+
+    @classmethod
+    def _campaign_has_recent_reserve(cls, id_campaign, grace_sec=None):
+        """True si hay reserva INCR reciente (evita corrección agresiva en audit)."""
+        grace_sec = grace_sec if grace_sec is not None else RESERVE_GRACE_SEC
+        cls.connect_redis_dialer()
+        pattern = f'OML:CALLS:RESERVE_TS:{id_campaign}:*'
+        now = int(time.time())
+        try:
+            for key in cls.REDIS_DIALER_CONNECTION.scan_iter(match=pattern, count=50):
+                ts_raw = cls.REDIS_DIALER_CONNECTION.get(key)
+                if ts_raw is None:
+                    continue
+                try:
+                    if now - int(ts_raw) < grace_sec:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+        except Exception as e:
+            logger.debug('Reserve grace check failed camp %s: %s', id_campaign, e)
+        return False
+
+    @classmethod
+    def _get_campaign_dialer_status(cls, id_campaign):
+        with cls.get_dialer_connection() as conn_dialer:
+            cursor = conn_dialer.cursor()
+            cursor.execute(
+                'SELECT dialer_status FROM ONLY campaign WHERE id = %s',
+                (id_campaign,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return row[0]
+
+    @classmethod
+    def _fetch_asterisk_dialer_channel_counts(cls):
+        """Invoca job sync audit-dialer-channels en ACD; retorna {camp_id: count}."""
+        try:
+            client = cls._get_gearman_client()
+            completed = client.submit_job(
+                'audit-dialer-channels',
+                b'{}',
+                background=False,
+                wait_until_complete=True,
+                poll_timeout=10.0,
+            )
+            if completed and getattr(completed, 'data', None):
+                raw = completed.data
+                if isinstance(raw, bytes):
+                    raw = raw.decode('utf-8')
+                data = json.loads(raw)
+                return {int(k): int(v) for k, v in data.items()}
+        except Exception as e:
+            logger.error(
+                'Failed to fetch asterisk dialer channel counts: %s', e, exc_info=True,
+            )
+        return {}
 
     @classmethod
     @timed_lru_cache(seconds=600, maxsize=128)
@@ -1737,10 +1876,9 @@ class AverageWorker(DialerWorker):
                 )
 
             # Liberamos la reserva que se hizo en el loop
-            cls.connect_redis_dialer()
-            key_calls = f'OML:CALLS:{id_campaign}:DIALER'
-            cls.REDIS_DIALER_CONNECTION.decrby(key_calls, 1)
-            cls._publish_calls_count(id_campaign)
+            cls._decrement_calls_once(
+                id_campaign, id_contact, None, context='blacklist_skip',
+            )
             
             # Actualizamos Redis para estadísticas
             cls.REDIS_DIALER_CONNECTION.hset(
@@ -1758,7 +1896,6 @@ class AverageWorker(DialerWorker):
                     # --- NOTA: La reserva ya se hizo en process_campaign_inside ---
                     # Solo necesitamos hacer rollback si falla
                     cls.connect_redis_dialer()
-                    key_calls = f'OML:CALLS:{id_campaign}:DIALER'
                     
                     try:
                         logger.debug(f'Calling contact {id_contact} (reservation already made)')
@@ -1784,21 +1921,10 @@ class AverageWorker(DialerWorker):
                         
                     except Exception as e:
                         # --- ROLLBACK DE RESERVA ---
-                        # Si falló el envío a Gearman, liberamos la reserva
-                        try:
-                            calls = cls.REDIS_DIALER_CONNECTION.decrby(key_calls, 1)
-                            # Protección contra valores negativos
-                            if calls < 0:
-                                cls.REDIS_DIALER_CONNECTION.set(key_calls, 0)
-                                logger.warning(
-                                    f"Redis counter went negative for campaign {id_campaign}, "
-                                    f"reset to 0"
-                                )
-                            cls._publish_calls_count(id_campaign)
-                        except Exception as redis_error:
-                            logger.error(
-                                f"Error during rollback of Redis counter: {redis_error}"
-                            )
+                        cls._decrement_calls_once(
+                            id_campaign, id_contact, None,
+                            context='gearman_dial_rollback', use_dedup=False,
+                        )
                         logger.error(f"Error sending dial job to Gearman, reservation rolled back: {e}")
                         
                         # Marcamos para reintento en DB
@@ -1809,10 +1935,10 @@ class AverageWorker(DialerWorker):
                         return b'Contact call failed, marked for retry'
                 else:
                     # No está permitido llamar (horario), liberamos la reserva
-                    cls.connect_redis_dialer()
-                    key_calls = f'OML:CALLS:{id_campaign}:DIALER'
-                    cls.REDIS_DIALER_CONNECTION.decrby(key_calls, 1)
-                    cls._publish_calls_count(id_campaign)
+                    cls._decrement_calls_once(
+                        id_campaign, id_contact, None,
+                        context='not_allowed_hours', use_dedup=False,
+                    )
                     
                     # Marcamos para reintento
                     cursor_dialer.execute(
@@ -1822,10 +1948,10 @@ class AverageWorker(DialerWorker):
                     return b'Contact skipped: Not allowed to call (hours)'
             else:
                 # Campaña no activa, liberamos la reserva
-                cls.connect_redis_dialer()
-                key_calls = f'OML:CALLS:{id_campaign}:DIALER'
-                cls.REDIS_DIALER_CONNECTION.decrby(key_calls, 1)
-                cls._publish_calls_count(id_campaign)
+                cls._decrement_calls_once(
+                    id_campaign, id_contact, None,
+                    context='campaign_not_active', use_dedup=False,
+                )
                 
                 # Marcamos para reintento
                 cursor_dialer.execute(
@@ -2069,22 +2195,9 @@ class AverageWorker(DialerWorker):
                 )
                 return b'Event was processed'
             cls.connect_redis_dialer()
-            key_calls = f'OML:CALLS:{id_campaign}:DIALER'
-            try:
-                val = cls.REDIS_DIALER_CONNECTION.decr(key_calls)
-                if val < 0:
-                    cls.REDIS_DIALER_CONNECTION.set(key_calls, 0)
-                    logger.warning(
-                        "Campaign %s: call count went negative on RouteValidationFailed, reset to 0",
-                        id_campaign,
-                    )
-                cls._publish_calls_count(id_campaign)
-            except Exception as e:
-                logger.error(
-                    "Campaign %s: error decrementing call count on RouteValidationFailed: %s",
-                    id_campaign, e,
-                    exc_info=True,
-                )
+            cls._decrement_calls_once(
+                id_campaign, contact_id, callid, context='RouteValidationFailed',
+            )
             cls.GM_CLIENT.submit_job('send-reports', job.data, background=True)
             logger.info(
                 "process_event [%s]: RouteValidationFailed, decrement | campaign=%s contact=%s phone=%s",
@@ -2095,30 +2208,16 @@ class AverageWorker(DialerWorker):
         # ----- ChannelDestroyed (canal PSTN liberado): decrementar y reportar -----
         if event_type in ('ChannelDestroyed', 'ChannelDestroy'):
             if call_type == 'to_pstn' and int(id_campaign or 0) != 0:
-                cls.connect_redis_dialer()
-                key_calls = f'OML:CALLS:{id_campaign}:DIALER'
-                try:
-                    val = cls.REDIS_DIALER_CONNECTION.decr(key_calls)
-                    if val < 0:
-                        cls.REDIS_DIALER_CONNECTION.set(key_calls, 0)
-                        logger.warning(
-                            "Campaign %s: call count went negative on ChannelDestroyed, reset to 0",
-                            id_campaign,
-                        )
-                    cls._publish_calls_count(id_campaign)
-                except Exception as e:
-                    logger.error(
-                        "Campaign %s: error decrementing call count on ChannelDestroyed: %s",
-                        id_campaign, e,
-                        exc_info=True,
-                    )
+                cls._decrement_calls_once(
+                    id_campaign, contact_id, callid, context='ChannelDestroyed',
+                )
                 cls.GM_CLIENT.submit_job('send-reports', job.data, background=True)
                 logger.debug(
                     "process_event [%s]: ChannelDestroyed to_pstn, decrement y send-reports | campaign=%s",
                     callid, id_campaign,
                 )
             else:
-                logger.debug(
+                logger.warning(
                     "process_event [%s]: ChannelDestroyed ignorado (call_type=%s o campaña 0)",
                     callid, call_type,
                 )
@@ -2172,25 +2271,10 @@ class AverageWorker(DialerWorker):
                 callid, id_campaign, contact_id, phone_number, dialstatus, fail_status,
             )
             cls.handle_fail_event(ari_event_data, id_campaign, contact_id, phone_number)
-            # CANCEL/AMD/EXIT_SHORTCALL: decrement aquí (ari-app no envía ChannelDestroyed para estos)
-            if dialstatus in ('CANCEL', 'AMD', 'EXIT_SHORTCALL') and int(id_campaign or 0) != 0:
-                cls.connect_redis_dialer()
-                key_calls = f'OML:CALLS:{id_campaign}:DIALER'
-                try:
-                    val = cls.REDIS_DIALER_CONNECTION.decr(key_calls)
-                    if val < 0:
-                        cls.REDIS_DIALER_CONNECTION.set(key_calls, 0)
-                        logger.warning(
-                            "Campaign %s: call count went negative on Dial %s, reset to 0",
-                            id_campaign, dialstatus,
-                        )
-                    cls._publish_calls_count(id_campaign)
-                except Exception as e:
-                    logger.error(
-                        "Campaign %s: error decrementing call count on Dial %s: %s",
-                        id_campaign, dialstatus, e,
-                        exc_info=True,
-                    )
+            if dialstatus in CALLS_DECR_DIAL_STATUSES and int(id_campaign or 0) != 0:
+                cls._decrement_calls_once(
+                    id_campaign, contact_id, callid, context=f'Dial {dialstatus}',
+                )
                 logger.debug(
                     "process_event [%s]: Dial %s, decrement | campaign=%s",
                     callid, dialstatus, id_campaign,
@@ -2421,6 +2505,7 @@ class AverageWorker(DialerWorker):
         id_campaign = data['id_campaign']
         sync_omnileads = data['sync_omnileads']
         logger.debug(f'Stopping campaign with id = {id_campaign}')
+        cls.reset_dialer_calls_counter(id_campaign, reason='stop_campaign')
         cls.set_campaign_status(id_campaign, FINALIZED, sync_omnileads=sync_omnileads)
         return b'Campaign was finalized'
 
@@ -2554,59 +2639,63 @@ class AverageWorker(DialerWorker):
     @classmethod
     def audit_active_channels(cls):
         """
-        Sincroniza el conteo de canales activos con Redis.
-        La fuente de verdad de canales queda en el ACD/Gearman; este método está preparado
-        para recibir en el futuro una lista de canales (p. ej. vía API o job) y actualizar Redis.
+        Reconcilia OML:CALLS:{camp}:DIALER con canales dialer PSTN reales en Asterisk (vía ACD).
         """
         logger.info("Iniciando auditoría de canales activos (Sanity Check)...")
-        
+
         try:
-            # Fuente de canales: en el futuro puede venir de ACD/Gearman o API
-            channels = []  # Sin conexión ARI directa; rellenar cuando exista integración
-
-            # 2. Mapear canales por id_campaign
-            # El caller_id tiene formato: {id_campaign}_{id_customer}_{phone_number}
-            actual_counts = {}
-            
-            for chan in channels:
-                caller_name = chan.get('caller', {}).get('name', '')
-                if not caller_name:
-                    continue
-                
-                parts = caller_name.split('_')
-                if len(parts) >= 2:
-                    try:
-                        camp_id = int(parts[0])
-                        actual_counts[camp_id] = actual_counts.get(camp_id, 0) + 1
-                    except ValueError:
-                        continue
-
-            # 3. Obtener todas las campañas que Redis cree que tienen llamadas
+            asterisk_counts = cls._fetch_asterisk_dialer_channel_counts()
             cls.connect_redis_dialer()
-            # Buscamos todas las llaves OML:CALLS:*:DIALER
-            redis_keys = cls.REDIS_DIALER_CONNECTION.keys('OML:CALLS:*:DIALER')
-            
-            pipe = cls.REDIS_DIALER_CONNECTION.pipeline()
+            redis_keys = cls.REDIS_DIALER_CONNECTION.keys('OML:CALLS:*:DIALER') or []
 
-            # 4. Sincronizar campañas activas según conteo de canales
-            for camp_id, count in actual_counts.items():
-                key = f'OML:CALLS:{camp_id}:DIALER'
-                logger.debug(f"Audit: Campaña {camp_id} tiene {count} canales reales.")
-                pipe.set(key, count)
-
-            # 5. Limpiar campañas que Redis cree que tienen llamadas pero el conteo real es 0
+            camps_to_check = set(asterisk_counts.keys())
             for key in redis_keys:
                 try:
-                    # Extraer ID de la campaña de la llave 'OML:CALLS:{id}:DIALER'
-                    camp_id_in_redis = int(key.split(':')[2])
-                    if camp_id_in_redis not in actual_counts:
-                        logger.warning(f"Audit: Campaña {camp_id_in_redis} en Redis tiene llamadas huérfanas. Reseteando a 0.")
-                        pipe.set(key, 0)
+                    camps_to_check.add(int(key.split(':')[2]))
                 except (IndexError, ValueError):
                     continue
 
-            pipe.execute()
-            logger.info("Auditoría completada exitosamente.")
+            corrections = 0
+            for camp_id in camps_to_check:
+                key = f'OML:CALLS:{camp_id}:DIALER'
+                redis_raw = cls.REDIS_DIALER_CONNECTION.get(key)
+                try:
+                    redis_count = int(redis_raw or 0)
+                except (TypeError, ValueError):
+                    redis_count = 0
+                asterisk_count = int(asterisk_counts.get(camp_id, 0))
+                dialer_status = cls._get_campaign_dialer_status(camp_id)
+                campaign_active = dialer_status == ACTIVE
+
+                should_correct = False
+                target = asterisk_count
+
+                if not campaign_active and redis_count > 0:
+                    should_correct = True
+                    target = asterisk_count
+                elif redis_count > asterisk_count:
+                    if cls._campaign_has_recent_reserve(camp_id):
+                        logger.debug(
+                            'Audit: skip camp %s (recent reserve) redis=%s asterisk=%s',
+                            camp_id, redis_count, asterisk_count,
+                        )
+                        continue
+                    should_correct = True
+                    target = asterisk_count
+
+                if should_correct and redis_count != target:
+                    logger.warning(
+                        'Audit corrected camp %s: redis=%s asterisk=%s status=%s -> set %s',
+                        camp_id, redis_count, asterisk_count, dialer_status, target,
+                    )
+                    cls.REDIS_DIALER_CONNECTION.set(key, target)
+                    cls._publish_calls_count(camp_id)
+                    corrections += 1
+
+            logger.info(
+                "Auditoría completada (%s correcciones, asterisk_camps=%s).",
+                corrections, len(asterisk_counts),
+            )
 
         except Exception as e:
             logger.error(f"Error crítico en audit_active_channels: {e}", exc_info=True)
@@ -3069,6 +3158,36 @@ class SchedulerWorker(AverageWorker):
         _SCHED_LISTENER_REGISTERED = True
         logger.debug("Scheduler listener registrado para ADDED/EXECUTED/ERROR/REMOVED/MISSED")
 
+    @classmethod
+    def _register_audit_job_once(cls):
+        """Programa reconciliación periódica OML:CALLS ↔ Asterisk."""
+        global _AUDIT_JOB_REGISTERED
+        if _AUDIT_JOB_REGISTERED:
+            return
+        interval = CHANNEL_AUDIT_INTERVAL_SEC
+        if interval <= 0:
+            logger.info("CHANNEL_AUDIT_INTERVAL_SEC=%s: audit job deshabilitado", interval)
+            _AUDIT_JOB_REGISTERED = True
+            return
+        cls._register_listener_once()
+        if not cls.SCHEDULER.running:
+            cls.SCHEDULER.start(paused=False)
+        job_id = 'audit_dialer_channels'
+        if cls.SCHEDULER.get_job(job_id) is None:
+            cls.SCHEDULER.add_job(
+                cls.audit_active_channels,
+                'interval',
+                seconds=interval,
+                id=job_id,
+                replace_existing=True,
+                max_instances=1,
+            )
+            logger.info(
+                "Scheduler: audit_active_channels cada %ss (job_id=%s)",
+                interval, job_id,
+            )
+        _AUDIT_JOB_REGISTERED = True
+
     # ---------- Funciones ejecutadas por los jobs ----------
     @classmethod
     def schedule_contact(cls, phone_number, id_campaign, id_contact):
@@ -3099,6 +3218,7 @@ class SchedulerWorker(AverageWorker):
     @job_handler_decorator
     def schedule_agenda(cls, worker, job):
         cls._register_listener_once()
+        cls._register_audit_job_once()
         if not cls.SCHEDULER.running:
             cls.SCHEDULER.start(paused=False)
 

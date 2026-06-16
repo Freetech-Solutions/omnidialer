@@ -774,6 +774,59 @@ class MyTestSuite(unittest.TestCase):
 
             AverageWorker.process_campaign = process_campaign_cm
 
+    def test_originate_failed_decrements_calls(self):
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 3)
+        AverageWorker.GM_CLIENT.submit_job = MagicMock()
+        event = self.gen_fail_event('ORIGINATE_FAILED')
+        event['callid'] = 'test-originate-fail-1'
+        job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(event), encoding="UTF8"),
+        )
+        AverageWorker.process_event(self.worker, job)
+        val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
+        self.assertEqual(int(val), 2)
+
+    def test_decrement_calls_once_idempotent(self):
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 2)
+        callid = 'dup-test-callid'
+        AverageWorker._decrement_calls_once(4, 1, callid, context='test')
+        AverageWorker._decrement_calls_once(4, 1, callid, context='test-dup')
+        val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
+        self.assertEqual(int(val), 1)
+
+    def test_reset_dialer_calls_counter(self):
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
+        AverageWorker.reset_dialer_calls_counter(4, reason='test')
+        val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
+        self.assertEqual(int(val), 0)
+
+    def test_stop_campaign_resets_calls_counter(self):
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
+        job = GearmanJob(
+            None, None, b'stop-campaign', bytes(str(uuid.uuid4()), encoding='utf8'),
+            b'{"id_campaign": "4", "sync_omnileads": "false"}',
+        )
+        AverageWorker.stop_campaign(self.worker, job)
+        val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
+        self.assertEqual(int(val), 0)
+
+    def test_audit_active_channels_corrects_ghost(self):
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+            conn.cursor().execute(
+                'UPDATE campaign SET dialer_status = %s WHERE id = 4', (FINALIZED,)
+            )
+        AverageWorker._fetch_asterisk_dialer_channel_counts = MagicMock(return_value={4: 0})
+        AverageWorker.audit_active_channels()
+        val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
+        self.assertEqual(int(val), 0)
+
 
 if __name__ == '__main__':
     unittest.main()
