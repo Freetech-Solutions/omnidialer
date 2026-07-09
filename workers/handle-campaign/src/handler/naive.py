@@ -257,6 +257,9 @@ def job_handler_decorator(method):
         worker_class = args[0]
         job = args[2]
         id_job = worker_class.insert_job(job)
+        if id_job is None:
+            # Duplicate Gearman delivery — another worker is already processing this job
+            return None
         try:
             result = method(*args, **kwargs)
             worker_class.remove_job(id_job)
@@ -393,9 +396,15 @@ class AverageWorker(DialerWorker):
             job_unique = job.unique.decode('utf8')
             job_name = job.task.decode('utf8')
             cursor.execute(
-                'INSERT INTO jobs (job_id, job_name, status) VALUES (%s, %s, %s) RETURNING id;',
+                'INSERT INTO jobs (job_id, job_name, status) VALUES (%s, %s, %s) '
+                'ON CONFLICT (job_id) DO NOTHING RETURNING id;',
                 (job_unique, job_name, JOB_STARTED))
-            return cursor.fetchone()[0]
+            row = cursor.fetchone()
+            if row is None:
+                # Job already being handled by another worker (duplicate delivery from Gearman)
+                logger.warning(f"Duplicate job skipped: job_id={job_unique}, job_name={job_name}")
+                return None
+            return row[0]
 
     @classmethod
     def save_job_error(cls, id_job, exception):

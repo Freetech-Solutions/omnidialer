@@ -3,7 +3,7 @@ FROM python:3.12-alpine AS builder
 
 WORKDIR /app
 
-RUN apk add git
+RUN apk add --no-cache git
 
 COPY ./requirements.txt /app/
 
@@ -13,7 +13,7 @@ FROM python:3.12-alpine AS run
 
 WORKDIR /app
 
-RUN apk add tzdata
+RUN apk add --no-cache tzdata
 
 COPY --from=builder /usr/local /usr/local
 COPY . /app

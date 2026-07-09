@@ -1,0 +1,7 @@
+# Excepciones de seguridad Trivy (ISO 27001 — riesgos aceptados / falsos positivos).
+# Documentar cada entrada: CVE, justificación, responsable, fecha de revisión y expiración.
+#
+# Formato: https://aquasecurity.github.io/trivy/latest/docs/configuration/filtering/
+#
+# Ejemplo (.trivyignore):
+# CVE-2024-12345
