@@ -1,0 +1,9 @@
+# Excepciones documentadas - Revisado por DevSecOps
+# Formato: {commit}:{file}:{rule}:{line}
+#
+# Hallazgos históricos reportados por gitleaks_scan (pipeline).
+# - docker-swarm/env.sh: password de lab en commit revertido (archivo ya no existe en HEAD).
+# - notes.org: ejemplo ARI localhost en notas de desarrollo (commit histórico).
+
+cb9a5fc104f3f5da10464a0068a1dce6cfdb14cc:docker-swarm/env.sh:generic-api-key:58
+4cd979999124e719f11283443612c9ae5f86eb83:notes.org:curl-auth-user:4

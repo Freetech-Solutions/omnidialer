@@ -1,7 +1,7 @@
 * Notes about misc stuff useful
 ** Subscribe to events
 With the following we can subscribe to events of the dialer of OML dialplan:
-curl -X POST -u omnileadsami:5_MeO_DMT http://localhost:8888/ari/applications/call_manager_dialer/subscription -H 'content-type: application/json' -d '{"eventSource": "endpoint:PJSIP"}'
+curl -X POST -u omnileadsami:omnileadsass http://localhost:8888/ari/applications/call_manager_dialer/subscription -H 'content-type: application/json' -d '{"eventSource": "endpoint:PJSIP"}'
 TODO: try with "endpoint:PJSIP/omlacd", see if we can config read only the events from dialer trunk
 ** Maximum number of concurrent calls in FTS production
 ~ 400
