@@ -8,12 +8,15 @@ include:
       - 'templates/security-scans.yml'
       - 'templates/gitleaks.yml'
       - 'templates/owasp-dependency-check.yml'
+      - 'templates/sonarqube.yml'
 
 variables:
   # Valores válidos: omnileads | freetechsolutions. Vacío = según rama (main → omnileads).
   DOCKER_ORG: ""
   FULL: ""
   BUILD: ""
+  # SKIP_OWASP=true → omite owasp_dependency_scan y owasp_defectdojo_upload (útil con FULL=true).
+  SKIP_OWASP: ""
   PYTHON_VERSION: "3.12"
   DOCKER_HOST: tcp://docker:2375
   DOCKER_TLS_CERTDIR: ""
@@ -29,6 +32,7 @@ variables:
   # Sin variables → sonarqube, build, security_scan y security_report (+ gitleaks/owasp en security).
   # BUILD=true → solo build (container-image).
   # FULL=true → pipeline completo: tests, SAST, gitleaks, owasp, sonarqube, build y escaneos de seguridad.
+  # FULL=true + SKIP_OWASP=true → igual que FULL, sin OWASP.
 
 stages:
   - security
@@ -75,6 +79,8 @@ stages:
 
 .owasp-rules: &owasp-rules
   rules:
+    - if: '$SKIP_OWASP == "true"'
+      when: never
     - if: '$BUILD == "true" && $FULL != "true"'
       when: never
     - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-3.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop-3.0")'
@@ -110,24 +116,15 @@ test:dialer:
   <<: *full-pipeline-rules
   allow_failure: false
 
-sonarqube-check:
+# Job SonarQube centralizado en omnileads/devsecops (templates/sonarqube.yml).
+sonarqube_scan:
   stage: sonarqube
-  image:
-    name: sonarsource/sonar-scanner-cli:latest
-    entrypoint: [""]
-  variables:
-    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
-    GIT_DEPTH: "0"
-  cache:
-    key: "sonar-scanner-cache"
-    paths:
-      - .sonar/cache
-  script:
-    - sonar-scanner
   needs:
     - job: test:dialer
       optional: true
-  allow_failure: true
+  <<: *sonar-rules
+
+sonarqube_defectdojo_upload:
   <<: *sonar-rules
 
 .build_template:
@@ -205,7 +202,7 @@ container-image:
       - ${IMAGE_NAME}.tar
     expire_in: 90 days
 
-# Los jobs trivy_scan, defectdojo_upload, gitleaks_defectdojo_upload y owasp_defectdojo_upload se heredan de devsecops.
+# Los jobs trivy_scan, defectdojo_upload, gitleaks_defectdojo_upload, owasp_defectdojo_upload y sonarqube_defectdojo_upload se heredan de devsecops.
 
 trivy_scan:
   parallel:
@@ -223,4 +220,7 @@ gitleaks_scan:
 # GitLab no expande ${OWASP_SCAN_STAGE} del template incluido en el campo stage.
 owasp_dependency_scan:
   stage: security
+  <<: *owasp-rules
+
+owasp_defectdojo_upload:
   <<: *owasp-rules
