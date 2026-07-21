@@ -7,3 +7,5 @@
 
 cb9a5fc104f3f5da10464a0068a1dce6cfdb14cc:docker-swarm/env.sh:generic-api-key:58
 4cd979999124e719f11283443612c9ae5f86eb83:notes.org:curl-auth-user:4
+# Placeholder user:password también matchea curl-auth-user (commit intermedio).
+38af8050d40c2422932afac489adaafe13d07286:notes.org:curl-auth-user:4
