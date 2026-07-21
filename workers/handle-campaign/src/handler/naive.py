@@ -1983,19 +1983,22 @@ class AverageWorker(DialerWorker):
                     )
                     return b'Contact skipped: Not allowed to call (hours)'
             else:
-                # Campaña no activa, liberamos la reserva
+                # Campaña pausada/finalizada: abortar agenda y liberar reserva.
+                # schedule_aborted permite re-seleccionar el contacto al reactivar.
+                logger.debug(
+                    f'Campaign {id_campaign} is not active '
+                    f'(status={status_campaign}), aborting call'
+                )
                 cls._decrement_calls_once(
                     id_campaign, id_contact, None,
                     context='campaign_not_active', use_dedup=False,
                 )
-
-                # Marcamos para reintento
                 cursor_dialer.execute(
-                    'UPDATE contact_in_campaign SET status = %s '
+                    'UPDATE contact_in_campaign SET schedule_aborted = true '
                     'WHERE id_contact = %s AND id_campaign = %s',
-                    (STATUS_CREATED, id_contact, id_campaign)
+                    (id_contact, id_campaign)
                 )
-                return b'Contact skipped: Campaign not active'
+                return b'Aborted call, campaign is not active'
 
     @classmethod
     @job_handler_decorator
