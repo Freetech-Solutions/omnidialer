@@ -209,4 +209,3 @@ class GearmanDialer(Dialer):
         payload_bytes = cls.encode_payload(payload)
         cls.GM_CLIENT.submit_job('add-incidence-rule-disposition', payload_bytes)
         return json.dumps({'msg': 'Disposition added'})
-

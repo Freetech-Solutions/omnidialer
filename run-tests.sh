@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
-export DOCKER_API_VERSION=1.44
+# Docker 24.x (CI dind) soporta hasta API 1.43; 1.44 requiere daemon >= 25.
+export DOCKER_API_VERSION=1.43
 
 if [ -z "$1" ]; then
     docker-compose --env-file .env-tests -f docker-compose-test.yml up -d --build --remove-orphans

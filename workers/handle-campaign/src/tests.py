@@ -598,7 +598,7 @@ class MyTestSuite(unittest.TestCase):
 
         # Restaurar el mock original para no afectar otros tests si fuera necesario
         # (aunque en setUp se recrea gran parte, es buena práctica si es método de clase)
-        del AverageWorker.is_blacklisted 
+        del AverageWorker.is_blacklisted
 
     def test_manual_call_blocks_blacklisted(self):
         """Verifica que una llamada manual a un blacklisted sea rechazada"""

@@ -50,6 +50,7 @@ def create_campaign(id_campaign):
         prefix = None
     return DIALER.create_campaign(id_campaign, strategy, prefix)
 
+
 @app.route('/edit-campaign/<id_campaign>', methods=['POST'])
 def edit_campaign(id_campaign):
     strategy = request.get_json().get('contact-strategy', [])

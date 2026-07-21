@@ -106,6 +106,9 @@ test:dialer:
   stage: test
   services:
     - docker:24.0.9-dind-alpine3.19
+  variables:
+    # Alinear cliente (apk docker-cli 25.x) con el tope del dind 24.x.
+    DOCKER_API_VERSION: "1.43"
   before_script:
     - apk add --no-cache docker-cli-compose
   script:
