@@ -185,6 +185,8 @@ NAME_TO_STATUS = {
     "CANCEL": STATUS_TERMINATED,  # llamada cancelada antes de contestar; sin reglas de incidencia
     "AMD": STATUS_AMD_MACHINE,  # contestador detectado; entidad propia en history y métricas
     "EXIT_SHORTCALL": STATUS_SHORTCALL,  # contestó y colgó en <5s; sin reglas de incidencia
+    # Fallo al originar (ACD); sin reglas de incidencia (FAIL_NO_RULES_EVENTS).
+    "ORIGINATE_FAILED": STATUS_CHANUNAVAIL,
 }
 
 # mapeo código -> nombre para interpretar history y métricas
