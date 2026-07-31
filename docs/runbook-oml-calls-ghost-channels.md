@@ -15,7 +15,7 @@ El contador refleja **reservas** del dialer (INCR antes de `process-contact`), n
 2. Postgres dialer: `SELECT dialer_status FROM campaign WHERE id = {id}`
 3. Logs `acd-app`: `ChannelDestroyed` sin metadata, `originate failed`, `ORIGINATE_FAILED`
 4. Logs `dialer-process-event`: `process_event`, `ChannelDestroyed ignorado`, `ORIGINATE_FAILED`
-5. Logs `dialer-scheduler`: `Audit corrected camp`
+5. Logs `dialer-channel-audit`: `Audit corrected camp`
 
 ## Mitigaciones desplegadas
 
@@ -25,7 +25,7 @@ El contador refleja **reservas** del dialer (INCR antes de `process-contact`), n
 | Reset al finalizar | stop_campaign / auto-FINALIZED | `SET OML:CALLS:{id}:DIALER 0` |
 | Metadata Redis | acd-app `acd:pending_dial:*` TTL 7200s | Multi-nodo + llamadas largas |
 | Decremento idempotente | `OML:CALLS:DECR:{camp}:{contact}:{callid}` | Sin doble DECR |
-| Audit 60s | dialer-scheduler → `audit-dialer-channels` (ACD) | Autocuración |
+| Audit 60s | dialer-scheduler encola `audit-active-channels` → dialer-channel-audit → `audit-dialer-channels` (ACD) | Autocuración |
 | Shutdown acd-app | `flush_pending_dialer_decrements_on_shutdown` | Reinicios planificados |
 
 ## Alertas recomendadas
