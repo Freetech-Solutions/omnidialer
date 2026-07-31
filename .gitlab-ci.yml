@@ -205,13 +205,14 @@ container-image:
       - ${IMAGE_NAME}.tar
     expire_in: 90 days
 
-# Los jobs trivy_scan, defectdojo_upload, gitleaks_defectdojo_upload, owasp_defectdojo_upload y sonarqube_defectdojo_upload se heredan de devsecops.
+# Los jobs trivy_scan, trivy_defectdojo_upload, gitleaks_defectdojo_upload, owasp_defectdojo_upload y sonarqube_defectdojo_upload se heredan de devsecops.
+# Solo se sobreescribe parallel/matrix; el job de upload de Trivy se llama trivy_defectdojo_upload (no defectdojo_upload).
 
 trivy_scan:
   parallel:
     matrix: *security-matrix
 
-defectdojo_upload:
+trivy_defectdojo_upload:
   parallel:
     matrix: *security-matrix
 
