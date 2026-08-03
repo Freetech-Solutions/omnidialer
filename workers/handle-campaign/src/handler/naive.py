@@ -267,7 +267,10 @@ return 0
 """
 
 # Dial statuses que liberan reserva OML:CALLS (sin esperar ChannelDestroyed)
-CALLS_DECR_DIAL_STATUSES = ('CANCEL', 'AMD', 'EXIT_SHORTCALL', 'ORIGINATE_FAILED')
+CALLS_DECR_DIAL_STATUSES = (
+    'CANCEL', 'AMD', 'EXIT_SHORTCALL', 'ORIGINATE_FAILED',
+    'INVALID_NUMBER', 'CHANUNAVAIL',
+)
 
 
 class CampaignNotFoundError(Exception):

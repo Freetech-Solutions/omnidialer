@@ -879,6 +879,48 @@ class MyTestSuite(unittest.TestCase):
         val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
         self.assertEqual(int(val), 2)
 
+    def test_dial_invalid_number_to_pstn_decrements(self):
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 3)
+        AverageWorker.GM_CLIENT.submit_job = MagicMock()
+        event = self.gen_fail_event('INVALID_NUMBER', call_type='to_pstn')
+        event['callid'] = 'invalid-pstn-1'
+        job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(event), encoding="UTF8"),
+        )
+        AverageWorker.process_event(self.worker, job)
+        val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
+        self.assertEqual(int(val), 2)
+
+    def test_dial_chanunavail_to_pstn_decrements(self):
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 3)
+        AverageWorker.GM_CLIENT.submit_job = MagicMock()
+        event = self.gen_fail_event('CHANUNAVAIL', call_type='to_pstn')
+        event['callid'] = 'chanunavail-pstn-1'
+        job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(event), encoding="UTF8"),
+        )
+        AverageWorker.process_event(self.worker, job)
+        val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
+        self.assertEqual(int(val), 2)
+
+    def test_dial_chanunavail_to_agent_does_not_decrement(self):
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 3)
+        AverageWorker.GM_CLIENT.submit_job = MagicMock()
+        event = self.gen_fail_event('CHANUNAVAIL', call_type='to_agent')
+        event['callid'] = 'chanunavail-agent-1'
+        job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(event), encoding="UTF8"),
+        )
+        AverageWorker.process_event(self.worker, job)
+        val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
+        self.assertEqual(int(val), 3)
+
     def _set_campaign_active(self, camp_id=4, max_channels=10):
         with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
             conn.cursor().execute(
