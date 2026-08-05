@@ -224,6 +224,33 @@ class MyTestSuite(unittest.TestCase):
         with self.assertRaises(KeyError):
             AverageWorker.process_event(self.worker, job)
 
+    def test_decode_fail_event_noanswer_without_dialstring(self):
+        self.assertEqual(
+            AverageWorker.decode_fail_event({'dialstatus': 'NOANSWER'}),
+            'NOANSWER',
+        )
+
+    def test_decode_fail_event_noanswer_dialstring_none(self):
+        self.assertEqual(
+            AverageWorker.decode_fail_event({'dialstatus': 'NOANSWER', 'dialstring': None}),
+            'NOANSWER',
+        )
+
+    def test_decode_fail_event_noanswer_agent_timeout(self):
+        self.assertEqual(
+            AverageWorker.decode_fail_event({
+                'dialstatus': 'NOANSWER',
+                'dialstring': 'camp_1@omlacd',
+            }),
+            'TIMEOUT',
+        )
+
+    def test_decode_fail_event_non_noanswer_passthrough(self):
+        self.assertEqual(
+            AverageWorker.decode_fail_event({'dialstatus': 'BUSY', 'dialstring': None}),
+            'BUSY',
+        )
+
     def test_incidence_rules_disposition(self):
         # make sure if a disposition came to the disposition endpoint and there is an incidence rule
         # disposition attached to it  will schedule a call if the contact has still a valid number

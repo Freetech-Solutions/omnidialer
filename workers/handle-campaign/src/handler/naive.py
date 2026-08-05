@@ -179,6 +179,8 @@ STATUS_CHANUNAVAIL = 8
 STATUS_INVALID_NUMBER = 9
 STATUS_AMD_MACHINE = 10  # AMD declaró MACHINE (contestador); entidad propia para métricas
 STATUS_SHORTCALL = 11  # contestó y colgó en <5s; entidad propia para métricas
+STATUS_TEMPORARILY_UNAVAILABLE = 13  # SIP 480; con reglas de incidencia
+STATUS_NOT_FOUND = 14  # SIP 404; sin reglas de incidencia
 
 NAME_TO_STATUS = {
     "CHANUNAVAIL": STATUS_CHANUNAVAIL,
@@ -195,6 +197,8 @@ NAME_TO_STATUS = {
     "EXIT_SHORTCALL": STATUS_SHORTCALL,  # contestó y colgó en <5s; sin reglas de incidencia
     # Fallo al originar (ACD); sin reglas de incidencia (FAIL_NO_RULES_EVENTS).
     "ORIGINATE_FAILED": STATUS_CHANUNAVAIL,
+    "480_TEMPORARILY_UNAVAILABLE": STATUS_TEMPORARILY_UNAVAILABLE,
+    "404_NOT_FOUND": STATUS_NOT_FOUND,
 }
 
 # mapeo código -> nombre para interpretar history y métricas
@@ -210,6 +214,8 @@ STATUS_TO_NAME = {
     STATUS_INVALID_NUMBER: "INVALID_NUMBER",
     STATUS_AMD_MACHINE: "AMD",  # AMD Detected / Contestador
     STATUS_SHORTCALL: "EXIT_SHORTCALL",
+    STATUS_TEMPORARILY_UNAVAILABLE: "480_TEMPORARILY_UNAVAILABLE",
+    STATUS_NOT_FOUND: "404_NOT_FOUND",
 }
 
 # contact final status
@@ -240,12 +246,13 @@ DISPOSITION_TYPE = 2
 FAIL_EVENTS = [
     'BUSY', 'NOANSWER', 'CONGESTION', 'TIMEOUT', 'TERMINATED', 'CHANUNAVAIL',
     'INVALID_NUMBER', 'CANCEL', 'AMD', 'EXIT_SHORTCALL', 'ORIGINATE_FAILED',
+    '480_TEMPORARILY_UNAVAILABLE', '404_NOT_FOUND',
 ]
 
 # fail statuses with no incidence rules
 FAIL_NO_RULES_EVENTS = [
     'CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'AMD', 'EXIT_SHORTCALL',
-    'ORIGINATE_FAILED',
+    'ORIGINATE_FAILED', '404_NOT_FOUND',
 ]
 
 # incidence rules multinum behauviour
@@ -269,7 +276,8 @@ return 0
 # Dial statuses que liberan reserva OML:CALLS (sin esperar ChannelDestroyed)
 CALLS_DECR_DIAL_STATUSES = (
     'CANCEL', 'AMD', 'EXIT_SHORTCALL', 'ORIGINATE_FAILED',
-    'INVALID_NUMBER', 'CHANUNAVAIL',
+    'INVALID_NUMBER', 'CHANUNAVAIL', '480_TEMPORARILY_UNAVAILABLE',
+    'NOANSWER', '404_NOT_FOUND',
 )
 
 
@@ -2413,7 +2421,7 @@ class AverageWorker(DialerWorker):
         dialstatus = ari_event_data.get('dialstatus')
         if dialstatus != "NOANSWER":
             return dialstatus
-        dialstring = ari_event_data.get('dialstring')
+        dialstring = ari_event_data.get('dialstring') or ''
         pattern_timeout = r'^camp_\d+@omlacd$'
         if re.match(pattern_timeout, dialstring):
             return "TIMEOUT"
