@@ -3,6 +3,9 @@ from settings.default import GEARMAN_JOB_SERVERS, GEARMAN_JOBS
 from handler.naive import AverageWorker, SchedulerWorker
 
 import gearman
+import logging
+
+logger = logging.getLogger(__name__)
 
 WORKER = AverageWorker
 
@@ -33,9 +36,17 @@ JOBS_TO_METHODS = {
     'render-template': WORKER.render_template,
     # medium processes
     'send-reports': WORKER.send_reports,
+    # channel audit (dedicated consumer)
+    'audit-active-channels': WORKER.audit_active_channels_job,
     # scheduled processes
     'schedule-agenda': SCHEDULER_WORKER.schedule_agenda
 }
+
+
+# Productor periódico: sólo en el worker que atiende schedule-agenda
+if 'schedule-agenda' in GEARMAN_JOBS:
+    logger.info('Starting periodic scheduler jobs (audit enqueue)')
+    SCHEDULER_WORKER.start_periodic_jobs()
 
 
 for job_name in GEARMAN_JOBS:
