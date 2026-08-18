@@ -221,6 +221,10 @@ gitleaks_scan:
   stage: security
   <<: *gitleaks-rules
 
+# Upload heredado de templates/gitleaks.yml; sin override ignora BUILD=true.
+gitleaks_defectdojo_upload:
+  <<: *gitleaks-rules
+
 # GitLab no expande ${OWASP_SCAN_STAGE} del template incluido en el campo stage.
 owasp_dependency_scan:
   stage: security
