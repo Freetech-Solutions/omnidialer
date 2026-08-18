@@ -11,6 +11,12 @@
                 {% endfor %}
             </ul>
         </div>
+        <div class="px-3 pb-3 border-top" id="pacing-stats"
+             hx-get="/htmx/pacing/{{ id_campaign }}"
+             hx-trigger="every 5s"
+             hx-swap="innerHTML">
+            {% include 'htmx/statistics_pacing.html' %}
+        </div>
         <div class="modal-footer">
             <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
         </div>

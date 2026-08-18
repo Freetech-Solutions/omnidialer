@@ -180,6 +180,14 @@ def stats(id_campaign):
     )
 
 
+@app.route('/htmx/pacing/<id_campaign>')
+def pacing_stats(id_campaign):
+    """Renders the predictive pacing metrics of a campaign (poll from the stats modal)"""
+    return DIALER.render_template(
+        {'type': 'pacing', 'id_campaign': id_campaign}
+    )
+
+
 @app.route('/htmx/manage-dialer/', methods=['POST'])
 def manage_dialer():
     action = request.form.get('action')
