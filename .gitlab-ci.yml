@@ -7,6 +7,7 @@ variables:
   DOCKER_HOST: tcp://docker:2375
   DOCKER_TLS_CERTDIR: ""
   DOCKER_DRIVER: overlay2
+  IMAGE_VERSION: ""
 
 services:
   - name: docker:dind
@@ -39,15 +40,15 @@ test:
     - ls -l ${DOCKERFILE_PATH}
     - docker buildx build --file=${DOCKERFILE_PATH} --tag=${IMAGE_NAME} ${BUILD_CONTEXT}
     - |-
+      IMAGE_VERSION="${IMAGE_VERSION:-$(date +%Y%m%d)-${CI_COMMIT_SHORT_SHA}}"
+      echo "Using IMAGE_VERSION=${IMAGE_VERSION}"
       echo "Pushing image ${IMAGE_NAME}..."
       if [ "${CI_COMMIT_BRANCH}" == "main" ]; then
         echo "${DOCKER_SECRET}" | docker login --username "${DOCKER_USERNAME}" --password-stdin
-        IMAGE_VERSION="$(date +%Y%m%d)-${CI_COMMIT_SHORT_SHA}"
         docker tag ${IMAGE_NAME} docker.io/omnileads/${IMAGE_NAME}:$IMAGE_VERSION
         docker push docker.io/omnileads/${IMAGE_NAME}:$IMAGE_VERSION
       else
         echo "${DOCKER_PASSWORD}" | docker login --username "${DOCKER_USER}" --password-stdin
-        IMAGE_VERSION="$(date +%Y%m%d)-${CI_COMMIT_SHORT_SHA}"
         docker tag ${IMAGE_NAME} docker.io/freetechsolutions/${IMAGE_NAME}:$IMAGE_VERSION
         docker push docker.io/freetechsolutions/${IMAGE_NAME}:$IMAGE_VERSION
       fi
