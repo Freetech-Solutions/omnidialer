@@ -79,6 +79,7 @@ _AUDIT_JOB_REGISTERED = False
 # Flag global para shutdown ordenado
 _SCHED_SHUTDOWN_DONE = False
 
+
 def _shutdown_scheduler_gracefully():
     """
     Cierra el scheduler sin bloquear para evitar warnings al terminar el proceso.
@@ -106,6 +107,7 @@ def _shutdown_scheduler_gracefully():
     except Exception as e:
         logger.debug("Scheduler shutdown: %s", e, exc_info=True)
 
+
 def _sched_sig_handler(signum, frame):
     """Ejecuta shutdown en un hilo daemon para no bloquear el signal handler."""
     try:
@@ -116,6 +118,7 @@ def _sched_sig_handler(signum, frame):
             logger.debug("SIG handler: no se pudo iniciar hilo para shutdown.", exc_info=True)
         except Exception:
             pass
+
 
 # Registrar hooks de salida (hazlo una sola vez por módulo)
 atexit.register(_shutdown_scheduler_gracefully)
@@ -582,9 +585,11 @@ end
 return {1, tostring(orphan), tostring(val), tostring(phase)}
 """
 
+
 class CampaignNotFoundError(Exception):
     """Raised when a campaign is expected to exist in the dialer database but does not."""
     pass
+
 
 def job_handler_decorator(method):
     def wrapper(*args, **kwargs):
@@ -605,6 +610,7 @@ def job_handler_decorator(method):
             worker_class.save_job_error(id_job, str(e))
             raise e
     return wrapper
+
 
 class AverageWorker(DialerWorker):
     """A worker flow with a dialing strategy, call contacts according to the available agents and
@@ -4983,6 +4989,7 @@ class AverageWorker(DialerWorker):
         if action == "stop":
             running = False
         return AdminRender.render_status_dialer(running)
+
 
 class SchedulerWorker(AverageWorker):
     """
