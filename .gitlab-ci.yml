@@ -3,12 +3,13 @@ include:
     rules:
       - if: '$FULL == "true"'
   - project: 'omnileads/devsecops'
-    ref: 'main'
+    ref: 'develop'
     file:
       - 'templates/security-scans.yml'
       - 'templates/gitleaks.yml'
       - 'templates/owasp-dependency-check.yml'
       - 'templates/sonarqube.yml'
+      - 'templates/docker-build-push.yml'
 
 variables:
   # Valores válidos: omnileads | freetechsolutions. Vacío = según rama (main → omnileads).
@@ -134,59 +135,6 @@ sonarqube_scan:
 sonarqube_defectdojo_upload:
   <<: *sonar-rules
 
-.build_template:
-  image: docker:24.0.9-alpine3.19
-  services:
-    - docker:24.0.9-dind-alpine3.19
-  before_script:
-    - apk add --no-cache docker-cli-buildx
-  script:
-    - echo "Building ${IMAGE_NAME}..."
-    - ls -l ${DOCKERFILE_PATH}
-    - docker buildx build --file=${DOCKERFILE_PATH} --tag=${IMAGE_NAME} ${BUILD_CONTEXT}
-    - docker save ${IMAGE_NAME} -o ${CI_PROJECT_DIR}/${IMAGE_NAME}.tar
-    - |-
-      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
-        echo "Pipeline de Merge Request: omitiendo login y push a Docker Hub."
-      elif [ -z "${DOCKER_PASSWORD:-}" ] && [ -z "${DOCKER_SECRET:-}" ]; then
-        echo "Credenciales de Docker no configuradas: omitiendo login y push."
-      else
-        echo "Pushing image ${IMAGE_NAME}..."
-
-        if [ -n "${DOCKER_ORG}" ]; then
-          if [[ "${DOCKER_ORG}" != "omnileads" && "${DOCKER_ORG}" != "freetechsolutions" ]]; then
-            echo "Error: DOCKER_ORG debe ser 'omnileads' o 'freetechsolutions'."
-            exit 1
-          fi
-          PUSH_ORG="${DOCKER_ORG}"
-        elif [[ "${CI_COMMIT_BRANCH}" == "main" ]]; then
-          PUSH_ORG="omnileads"
-        else
-          PUSH_ORG="freetechsolutions"
-        fi
-
-        if [[ "${PUSH_ORG}" == "omnileads" ]]; then
-          if [ -z "${DOCKER_SECRET:-}" ] || [ -z "${DOCKER_USERNAME:-}" ]; then
-            echo "Faltan credenciales para org omnileads: omitiendo push."
-          else
-            echo "${DOCKER_SECRET}" | docker login --username "${DOCKER_USERNAME}" --password-stdin
-            IMAGE_VERSION="$(date +%Y%m%d)-${CI_COMMIT_SHORT_SHA}"
-            docker tag ${IMAGE_NAME} docker.io/${PUSH_ORG}/${IMAGE_NAME}:$IMAGE_VERSION
-            docker push docker.io/${PUSH_ORG}/${IMAGE_NAME}:$IMAGE_VERSION
-          fi
-        else
-          if [ -z "${DOCKER_PASSWORD:-}" ] || [ -z "${DOCKER_USER:-}" ]; then
-            echo "Faltan credenciales para org freetechsolutions: omitiendo push."
-          else
-            echo "${DOCKER_PASSWORD}" | docker login --username "${DOCKER_USER}" --password-stdin
-            IMAGE_VERSION="$(date +%Y%m%d)-${CI_COMMIT_SHORT_SHA}"
-            docker tag ${IMAGE_NAME} docker.io/${PUSH_ORG}/${IMAGE_NAME}:$IMAGE_VERSION
-            docker push docker.io/${PUSH_ORG}/${IMAGE_NAME}:$IMAGE_VERSION
-          fi
-        fi
-      fi
-  <<: *build-rules
-
 .image-matrix: &image-matrix
   - IMAGE_NAME: dialer_api
     DOCKERFILE_PATH: interface/src/Dockerfile
@@ -200,8 +148,10 @@ sonarqube_defectdojo_upload:
   - IMAGE_NAME: dialer_worker
 
 container-image:
-  extends: .build_template
+  extends: .docker_container_image
   stage: build
+  variables:
+    DOCKER_TARGET: ""
   parallel:
     matrix: *image-matrix
   artifacts:
@@ -209,6 +159,7 @@ container-image:
       - ${IMAGE_NAME}.tar
     expire_in: 90 days
 
+  <<: *build-rules
 # Los jobs trivy_scan, trivy_defectdojo_upload, gitleaks_defectdojo_upload, owasp_defectdojo_upload y sonarqube_defectdojo_upload se heredan de devsecops.
 # Solo se sobreescribe parallel/matrix; el job de upload de Trivy se llama trivy_defectdojo_upload (no defectdojo_upload).
 
