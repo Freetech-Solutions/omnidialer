@@ -646,6 +646,17 @@ class DialModePacingTests(unittest.TestCase):
         mock_redis.hgetall.return_value = {}
         AverageWorker.REDIS_DIALER_CONNECTION = mock_redis
 
+        self._oml_camp = {}
+        self._orig_oml_redis = AverageWorker.REDIS_OML_CONNECTION
+        mock_oml = MagicMock()
+
+        def oml_hmget(key, *fields):
+            data = self._oml_camp.get(key, {})
+            return [data.get(field) for field in fields]
+
+        mock_oml.hmget.side_effect = oml_hmget
+        AverageWorker.REDIS_OML_CONNECTION = mock_oml
+
         self._orig_get_predictive = AverageWorker.get_predictive_model
         self._orig_get_boost = AverageWorker.get_boost_factor
         self._orig_get_agents = AverageWorker.get_number_available_agents
@@ -675,6 +686,7 @@ class DialModePacingTests(unittest.TestCase):
 
     def tearDown(self):
         AverageWorker.REDIS_DIALER_CONNECTION = self._orig_redis
+        AverageWorker.REDIS_OML_CONNECTION = self._orig_oml_redis
         AverageWorker.get_predictive_model = self._orig_get_predictive
         AverageWorker.get_boost_factor = self._orig_get_boost
         AverageWorker.get_number_available_agents = self._orig_get_agents
@@ -696,9 +708,10 @@ class DialModePacingTests(unittest.TestCase):
             pass
 
     def _set_power_keys(self, customdialerdst='0', voicebot='False'):
-        cid = self.campaign_id
-        self._redis[f'CAMP:{cid}:CUSTOMDIALERDST'] = customdialerdst
-        self._redis[f'CAMP:{cid}:VOICEBOT'] = voicebot
+        self._oml_camp[f'OML:CAMP:{self.campaign_id}'] = {
+            'CUSTOMDIALERDST': customdialerdst,
+            'VOICEBOT': voicebot,
+        }
 
     def test_resolve_dial_mode_power_by_customdialerdst(self):
         self._set_power_keys(customdialerdst='SIP/trunk')
@@ -713,6 +726,15 @@ class DialModePacingTests(unittest.TestCase):
         mode, reason = AverageWorker.resolve_dial_mode(self.campaign_id)
         self.assertEqual(mode, AverageWorker.DIAL_MODE_POWER)
         self.assertEqual(reason, 'VOICEBOT=True')
+
+    def test_resolve_dial_mode_ignores_stale_dialer_voicebot(self):
+        """DB3 CAMP:{id}:VOICEBOT=True no fuerza power si OML:CAMP es False."""
+        self._set_power_keys(customdialerdst='0', voicebot='False')
+        self._redis[f'CAMP:{self.campaign_id}:VOICEBOT'] = 'True'
+        AverageWorker.get_predictive_model = MagicMock(return_value=False)
+        mode, reason = AverageWorker.resolve_dial_mode(self.campaign_id)
+        self.assertEqual(mode, AverageWorker.DIAL_MODE_PROGRESSIVE)
+        self.assertEqual(reason, 'initial_predictive_model=False')
 
     def test_resolve_dial_mode_predictive(self):
         self._set_power_keys()

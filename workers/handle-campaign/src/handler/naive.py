@@ -3037,12 +3037,14 @@ class AverageWorker(DialerWorker):
 
     @classmethod
     def _power_dialer_reason(cls, id_campaign):
-        """Return reason string if campaign is power dialer, else None."""
-        customdialerdst = cls.REDIS_DIALER_CONNECTION.get(f'CAMP:{id_campaign}:CUSTOMDIALERDST')
-        voicebot = cls.REDIS_DIALER_CONNECTION.get(f'CAMP:{id_campaign}:VOICEBOT')
+        """Power si OML:CAMP tiene voicebot o destino custom. None si no."""
+        cls.connect_redis_oml()
+        customdialerdst, voicebot = cls.REDIS_OML_CONNECTION.hmget(
+            f'OML:CAMP:{id_campaign}', 'CUSTOMDIALERDST', 'VOICEBOT',
+        )
         if voicebot and str(voicebot).lower() == 'true':
             return 'VOICEBOT=True'
-        if customdialerdst is not None and customdialerdst != '0':
+        if customdialerdst not in (None, '', '0'):
             return f'CUSTOMDIALERDST={customdialerdst!r}'
         return None
 
@@ -3052,7 +3054,7 @@ class AverageWorker(DialerWorker):
         Decide automatic dialing mode for a campaign.
 
         Priority:
-          1) power: CUSTOMDIALERDST != '0' or VOICEBOT=true
+          1) power: OML:CAMP CUSTOMDIALERDST not in ('', '0') or VOICEBOT=true
           2) predictive: initial_predictive_model=true AND DIALER_PREDICTIVE_ENABLED
           3) progressive: otherwise (incluye FF off con flag de campaña)
         """
@@ -3521,7 +3523,7 @@ class AverageWorker(DialerWorker):
         Calculates how many NEW calls this campaign can originate in the current cycle.
 
         Modes (priority order):
-          - power: CUSTOMDIALERDST != '0' or CAMP:{id}:VOICEBOT=True
+          - power: OML:CAMP CUSTOMDIALERDST not in ('', '0') or VOICEBOT=True
               Fill up to max_channels (free channel headroom).
           - predictive: initial_predictive_model=True and DIALER_PREDICTIVE_ENABLED
               C_dial from hit-rate / expected free agents / ringing / gamma.
