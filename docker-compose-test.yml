@@ -1,3 +1,6 @@
+# Docker Compose para tests del worker handle-campaign.
+# Uso: ./run_tests.sh  (o el legacy ./run-tests.sh)
+
 services:
   job_server:
     image: artefactual/gearmand:1.1.18-alpine
@@ -13,10 +16,14 @@ services:
     container_name: omnidialer-worker-test
     build:
       context: ./workers/handle-campaign/src
+    working_dir: /app
     networks:
       - network1
     tty: true
     stdin_open: true
+    # Código del host montado: cambios locales sin rebuild (salvo requirements).
+    volumes:
+      - ./workers/handle-campaign/src:/app
     environment:
       - REDIS_OML_SERVER=${REDIS_OML_SERVER}
       - REDIS_OML_PORT=${REDIS_OML_PORT}
@@ -35,9 +42,12 @@ services:
       - DIALER_ACD_HOST=${DIALER_ACD_HOST}
       - TIME_BETWEEN_CALLS=${TIME_BETWEEN_CALLS}
     depends_on:
-      - job_server
-      - postgresql
-      - redis
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      job_server:
+        condition: service_started
 
   redis:
     container_name: omnidialer-redis-tests
@@ -54,7 +64,11 @@ services:
     volumes:
       - redis_omnidialer_tests:/data
     command: redis-server --port 6381
-
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6381", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
 
   postgresql:
     container_name: dialer-postgres-tests
@@ -78,6 +92,11 @@ services:
     volumes:
       - omnidialer_postgresql_tests:/var/lib/postgresql/data
       - ./omnidialer.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -p 5434"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
 
 networks:
   network1:

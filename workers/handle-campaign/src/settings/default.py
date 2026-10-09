@@ -22,6 +22,10 @@ TIME_BETWEEN_CALLS = os.getenv('TIME_BETWEEN_CALLS')
 CHANNEL_AUDIT_INTERVAL_SEC = int(os.getenv('DIALER_CHANNEL_AUDIT_INTERVAL_SEC', '60'))
 CHANNEL_AUDIT_LOCK_TTL_SEC = int(os.getenv('DIALER_CHANNEL_AUDIT_LOCK_TTL_SEC', '55'))
 RESERVE_GRACE_SEC = int(os.getenv('DIALER_RESERVE_GRACE_SEC', '30'))
+# Asymmetric audit hysteresis (ACD snapshot reducer)
+AUDIT_UP_STREAK_TICKS = int(os.getenv('DIALER_AUDIT_UP_STREAK_TICKS', '2'))
+AUDIT_DOWN_STREAK_TICKS = int(os.getenv('DIALER_AUDIT_DOWN_STREAK_TICKS', '4'))
+AUDIT_IDLE_DOWN_STREAK_TICKS = int(os.getenv('DIALER_AUDIT_IDLE_DOWN_STREAK_TICKS', '2'))
 
 # Predictive pacing (global defaults; overridable by env — not per-campaign yet)
 # D_max: abandon rate ceiling (EXIT_ABANDON+EXIT_TIMEOUT) / connects humanos

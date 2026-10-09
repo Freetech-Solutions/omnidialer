@@ -3,7 +3,7 @@
 import datetime
 import unittest
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from decimal import Decimal
 import psycopg
 import time
@@ -20,6 +20,7 @@ from handler.naive import (
     STATUS_TERMINATED, STATUS_EXIT_ABANDON, STATUS_EXIT_TIMEOUT,
     AUDIT_LOCK_KEY, AUDIT_ACTIVE_CHANNELS_JOB,
     PHASE_RINGING, PHASE_WAITING_AGENT, PHASE_ONCALL,
+    SCHEDULER_LEADER_KEY,
 )
 import handler.naive as naive_mod
 import settings.default as dialer_settings
@@ -37,6 +38,9 @@ class PredictiveConstantsTests(unittest.TestCase):
         self.assertEqual(dialer_settings.DROP_RATE_ALPHA, 0.1)
         self.assertEqual(dialer_settings.DEFAULT_ART_SEC, 15.0)
         self.assertEqual(dialer_settings.P_LIB_REMAINING_EPS, 1.0)
+        self.assertEqual(dialer_settings.AUDIT_UP_STREAK_TICKS, 2)
+        self.assertEqual(dialer_settings.AUDIT_DOWN_STREAK_TICKS, 4)
+        self.assertEqual(dialer_settings.AUDIT_IDLE_DOWN_STREAK_TICKS, 2)
         self.assertTrue(dialer_settings.PREDICTIVE_ENABLED)
         self.assertEqual(dialer_settings.GAMMA_THROTTLE_FLOOR, 0.2)
         self.assertEqual(dialer_settings.PACING_SNAPSHOT_TTL_SEC, 30)
@@ -2315,121 +2319,143 @@ class MyTestSuite(unittest.TestCase):
         val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
         self.assertEqual(int(val), 0)
 
-    def test_audit_active_channels_corrects_ghost(self):
+    def _seed_acd_nodes_registry(self, *node_ids):
+        """Ensure audit_active_channels does not bail on empty OML:ACD:NODES."""
         AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        r.delete('OML:ACD:NODES')
+        for node_id in node_ids:
+            r.sadd('OML:ACD:NODES', node_id)
+
+    def _run_audit_with_fetch(self, fetch_return, reserve=False, times=1):
+        """
+        fetch_return: (cluster_complete, counts, ringing)
+        """
+        original_fetch = AverageWorker._fetch_acd_snapshot_counts
+        original_reserve = AverageWorker._campaign_has_recent_reserve
+        AverageWorker._campaign_has_recent_reserve = MagicMock(return_value=reserve)
+        AverageWorker._fetch_acd_snapshot_counts = MagicMock(return_value=fetch_return)
+        try:
+            for _ in range(times):
+                AverageWorker.audit_active_channels()
+        finally:
+            AverageWorker._fetch_acd_snapshot_counts = original_fetch
+            AverageWorker._campaign_has_recent_reserve = original_reserve
+
+    def test_audit_active_channels_corrects_ghost_idle_after_streak(self):
+        AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1')
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
         with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
             conn.cursor().execute(
                 'UPDATE campaign SET dialer_status = %s WHERE id = 4', (FINALIZED,)
             )
-        original_fetch = AverageWorker._fetch_asterisk_dialer_channel_counts
-        AverageWorker._fetch_asterisk_dialer_channel_counts = MagicMock(
-            return_value=(True, {4: 0})
+        # Idle down streak default=2
+        self._run_audit_with_fetch((True, {4: 0}, {}), times=1)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 5,
         )
-        try:
-            AverageWorker.audit_active_channels()
-            val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
-            self.assertEqual(int(val), 0)
-        finally:
-            AverageWorker._fetch_asterisk_dialer_channel_counts = original_fetch
+        self._run_audit_with_fetch((True, {4: 0}, {}), times=1)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 0,
+        )
 
-    def test_audit_skips_when_ok_false(self):
+    def test_audit_skips_when_no_acd_nodes(self):
         AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.delete('OML:ACD:NODES')
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
-        original_fetch = AverageWorker._fetch_asterisk_dialer_channel_counts
-        AverageWorker._fetch_asterisk_dialer_channel_counts = MagicMock(
-            return_value=(False, {})
+        original_fetch = AverageWorker._fetch_acd_snapshot_counts
+        AverageWorker._fetch_acd_snapshot_counts = MagicMock(
+            return_value=(False, {}, {})
         )
         try:
             AverageWorker.audit_active_channels()
             val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
             self.assertEqual(int(val), 5)
         finally:
-            AverageWorker._fetch_asterisk_dialer_channel_counts = original_fetch
+            AverageWorker._fetch_acd_snapshot_counts = original_fetch
 
-    def test_fetch_asterisk_counts_reads_gearman_result(self):
-        completed = MagicMock()
-        completed.result = b'{"ok": true, "counts": {"4": 3}}'
-        completed.data = None
-        client = MagicMock()
-        client.submit_job.return_value = completed
-        original_get_client = AverageWorker._get_gearman_client
-        AverageWorker._get_gearman_client = MagicMock(return_value=client)
-        try:
-            ok, counts, ringing = AverageWorker._fetch_asterisk_dialer_channel_counts()
-            self.assertTrue(ok)
-            self.assertEqual(counts, {4: 3})
-            self.assertIsNone(ringing)
-        finally:
-            AverageWorker._get_gearman_client = original_get_client
+    def test_fetch_acd_snapshot_sums_fresh_nodes(self):
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        r.delete('OML:ACD:NODES')
+        r.sadd('OML:ACD:NODES', 'n1', 'n2')
+        r.set('OML:ACD:NODE:n1:HB', '1', ex=60)
+        r.set('OML:ACD:NODE:n2:HB', '1', ex=60)
+        r.delete('OML:ACD:n1:CHANNELS', 'OML:ACD:n2:CHANNELS')
+        r.delete('OML:ACD:n1:RINGING', 'OML:ACD:n2:RINGING')
+        r.hset('OML:ACD:n1:CHANNELS', mapping={'4': 2})
+        r.hset('OML:ACD:n2:CHANNELS', mapping={'4': 1, '7': 3})
+        r.hset('OML:ACD:n1:RINGING', mapping={'4': 1})
+        complete, counts, ringing = AverageWorker._fetch_acd_snapshot_counts()
+        self.assertTrue(complete)
+        self.assertEqual(counts, {4: 3, 7: 3})
+        self.assertEqual(ringing, {4: 1})
 
-    def test_fetch_asterisk_counts_falls_back_to_gearman_data(self):
-        completed = MagicMock()
-        completed.result = None
-        completed.data = b'{"ok": true, "counts": {"7": 2}}'
-        client = MagicMock()
-        client.submit_job.return_value = completed
-        original_get_client = AverageWorker._get_gearman_client
-        AverageWorker._get_gearman_client = MagicMock(return_value=client)
-        try:
-            ok, counts, ringing = AverageWorker._fetch_asterisk_dialer_channel_counts()
-            self.assertTrue(ok)
-            self.assertEqual(counts, {7: 2})
-            self.assertIsNone(ringing)
-        finally:
-            AverageWorker._get_gearman_client = original_get_client
+    def test_fetch_acd_snapshot_incomplete_skips_stale_node(self):
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        r.delete('OML:ACD:NODES')
+        r.sadd('OML:ACD:NODES', 'n1', 'n2')
+        r.set('OML:ACD:NODE:n1:HB', '1', ex=60)
+        r.delete('OML:ACD:NODE:n2:HB')
+        r.delete('OML:ACD:n1:CHANNELS', 'OML:ACD:n2:CHANNELS')
+        r.hset('OML:ACD:n1:CHANNELS', mapping={'4': 2})
+        r.hset('OML:ACD:n2:CHANNELS', mapping={'4': 9})
+        complete, counts, ringing = AverageWorker._fetch_acd_snapshot_counts()
+        self.assertFalse(complete)
+        self.assertEqual(counts, {4: 2})
+        self.assertEqual(ringing, {})
 
-    def test_fetch_asterisk_counts_parses_ringing_field(self):
-        completed = MagicMock()
-        completed.result = b'{"ok": true, "counts": {"4": 3}, "ringing": {"4": 1}}'
-        completed.data = None
-        client = MagicMock()
-        client.submit_job.return_value = completed
-        original_get_client = AverageWorker._get_gearman_client
-        AverageWorker._get_gearman_client = MagicMock(return_value=client)
-        try:
-            ok, counts, ringing = AverageWorker._fetch_asterisk_dialer_channel_counts()
-            self.assertTrue(ok)
-            self.assertEqual(counts, {4: 3})
-            self.assertEqual(ringing, {4: 1})
-        finally:
-            AverageWorker._get_gearman_client = original_get_client
-
-    def test_audit_corrects_undercount(self):
+    def test_audit_corrects_undercount_after_up_streak(self):
         self._set_campaign_active(4)
         AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1')
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 1)
-        original_fetch = AverageWorker._fetch_asterisk_dialer_channel_counts
-        original_reserve = AverageWorker._campaign_has_recent_reserve
-        AverageWorker._campaign_has_recent_reserve = MagicMock(return_value=False)
-        AverageWorker._fetch_asterisk_dialer_channel_counts = MagicMock(
-            return_value=(True, {4: 3})
+        # First tick: streak only
+        self._run_audit_with_fetch((True, {4: 3}, {}), times=1)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1,
         )
-        try:
-            AverageWorker.audit_active_channels()
-            val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
-            self.assertEqual(int(val), 3)
-        finally:
-            AverageWorker._fetch_asterisk_dialer_channel_counts = original_fetch
-            AverageWorker._campaign_has_recent_reserve = original_reserve
+        # Second tick: correct
+        self._run_audit_with_fetch((False, {4: 3}, {}), times=1)  # partial OK for up
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 3,
+        )
 
     def test_audit_skips_overcount_with_recent_reserve(self):
         self._set_campaign_active(4)
         AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1')
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
-        original_fetch = AverageWorker._fetch_asterisk_dialer_channel_counts
-        original_reserve = AverageWorker._campaign_has_recent_reserve
-        AverageWorker._campaign_has_recent_reserve = MagicMock(return_value=True)
-        AverageWorker._fetch_asterisk_dialer_channel_counts = MagicMock(
-            return_value=(True, {4: 1})
+        self._run_audit_with_fetch((True, {4: 1}, {}), reserve=True, times=4)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 5,
         )
-        try:
-            AverageWorker.audit_active_channels()
-            val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
-            self.assertEqual(int(val), 5)
-        finally:
-            AverageWorker._fetch_asterisk_dialer_channel_counts = original_fetch
-            AverageWorker._campaign_has_recent_reserve = original_reserve
+
+    def test_audit_skips_down_when_cluster_incomplete(self):
+        self._set_campaign_active(4)
+        AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1', 'n2')
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
+        self._run_audit_with_fetch((False, {4: 1}, {}), times=4)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 5,
+        )
+
+    def test_audit_corrects_overcount_after_down_streak(self):
+        self._set_campaign_active(4)
+        AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1')
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
+        self._run_audit_with_fetch((True, {4: 1}, {}), reserve=False, times=3)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 5,
+        )
+        self._run_audit_with_fetch((True, {4: 1}, {}), reserve=False, times=1)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1,
+        )
 
     def test_dial_cancel_to_agent_does_not_decrement(self):
         AverageWorker.connect_redis_dialer()
@@ -2958,7 +2984,8 @@ class MyTestSuite(unittest.TestCase):
         original_scheduler = SchedulerWorker.SCHEDULER
         SchedulerWorker.SCHEDULER = mock_scheduler
         try:
-            SchedulerWorker.start_periodic_jobs()
+            with patch.object(SchedulerWorker, '_start_leader_lease_once'):
+                SchedulerWorker.start_periodic_jobs()
             mock_scheduler.add_job.assert_called()
             call_args = mock_scheduler.add_job.call_args
             scheduled_fn = call_args.args[0]
@@ -2971,6 +2998,24 @@ class MyTestSuite(unittest.TestCase):
             self.assertEqual(call_args.kwargs.get('max_instances'), 1)
             self.assertTrue(call_args.kwargs.get('replace_existing'))
             self.assertTrue(naive_mod._AUDIT_JOB_REGISTERED)
+            mock_scheduler.start.assert_not_called()
+        finally:
+            SchedulerWorker.SCHEDULER = original_scheduler
+            naive_mod._AUDIT_JOB_REGISTERED = False
+
+    def test_ensure_scheduler_started_starts_paused(self):
+        naive_mod._AUDIT_JOB_REGISTERED = False
+        mock_scheduler = MagicMock()
+        mock_scheduler.running = False
+        original_scheduler = SchedulerWorker.SCHEDULER
+        SchedulerWorker.SCHEDULER = mock_scheduler
+        try:
+            with patch.object(SchedulerWorker, '_start_leader_lease_once') as start_lease:
+                with patch.object(SchedulerWorker, '_register_listener_once'):
+                    SchedulerWorker._ensure_scheduler_started()
+            mock_scheduler.start.assert_called_once_with(paused=True)
+            start_lease.assert_called_once()
+            mock_scheduler.add_job.assert_called()
         finally:
             SchedulerWorker.SCHEDULER = original_scheduler
             naive_mod._AUDIT_JOB_REGISTERED = False
@@ -3266,51 +3311,35 @@ class MyTestSuite(unittest.TestCase):
             AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:PHASE:4:1:x'),
         )
 
-    def test_audit_reconciles_ringing_with_new_payload(self):
+    def test_audit_reconciles_ringing_after_streaks(self):
         self._set_campaign_active(4)
         AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1')
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
         AverageWorker._init_campaign_channel_phases(4)
         AverageWorker.REDIS_DIALER_CONNECTION.hset('CAMP:4:CHANNELS', PHASE_RINGING, 4)
         AverageWorker.REDIS_DIALER_CONNECTION.hset(
             'CAMP:4:CHANNELS', PHASE_WAITING_AGENT, 1,
         )
-        original_fetch = AverageWorker._fetch_asterisk_dialer_channel_counts
-        original_reserve = AverageWorker._campaign_has_recent_reserve
-        AverageWorker._campaign_has_recent_reserve = MagicMock(return_value=False)
-        AverageWorker._fetch_asterisk_dialer_channel_counts = MagicMock(
-            return_value=(True, {4: 3}, {4: 2})
+        # calls down needs 4 ticks; ringing down also 4 — after 4 both settle
+        self._run_audit_with_fetch((True, {4: 3}, {4: 2}), reserve=False, times=4)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 3,
         )
-        try:
-            AverageWorker.audit_active_channels()
-            self.assertEqual(
-                int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 3,
-            )
-            phases = AverageWorker.get_campaign_channel_phases(4)
-            self.assertEqual(phases[PHASE_RINGING], 2)
-        finally:
-            AverageWorker._fetch_asterisk_dialer_channel_counts = original_fetch
-            AverageWorker._campaign_has_recent_reserve = original_reserve
+        phases = AverageWorker.get_campaign_channel_phases(4)
+        self.assertEqual(phases[PHASE_RINGING], 2)
 
-    def test_audit_skips_ringing_reconcile_without_field(self):
+    def test_audit_ringing_unchanged_on_first_mismatch_tick(self):
         self._set_campaign_active(4)
         AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1')
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 2)
         AverageWorker._init_campaign_channel_phases(4)
         AverageWorker.REDIS_DIALER_CONNECTION.hset('CAMP:4:CHANNELS', PHASE_RINGING, 2)
-        original_fetch = AverageWorker._fetch_asterisk_dialer_channel_counts
-        original_reserve = AverageWorker._campaign_has_recent_reserve
-        AverageWorker._campaign_has_recent_reserve = MagicMock(return_value=False)
-        AverageWorker._fetch_asterisk_dialer_channel_counts = MagicMock(
-            return_value=(True, {4: 2}, None)
-        )
-        try:
-            AverageWorker.audit_active_channels()
-            phases = AverageWorker.get_campaign_channel_phases(4)
-            self.assertEqual(phases[PHASE_RINGING], 2)
-        finally:
-            AverageWorker._fetch_asterisk_dialer_channel_counts = original_fetch
-            AverageWorker._campaign_has_recent_reserve = original_reserve
+        # observed ringing 0 → would down, but streak=1 keeps RINGING=2
+        self._run_audit_with_fetch((True, {4: 2}, {4: 0}), reserve=False, times=1)
+        phases = AverageWorker.get_campaign_channel_phases(4)
+        self.assertEqual(phases[PHASE_RINGING], 2)
 
     def _make_oml_cursor_for_shuffle(self, shuffle):
         cursor_oml = MagicMock()
@@ -3418,6 +3447,96 @@ class MyTestSuite(unittest.TestCase):
         self.assertEqual(ordered_contacts, list(range(100, 0, -1)))
         contacts_sql = [s for s in executed if 'ominicontacto_app_contacto' in s][0]
         self.assertIn('ORDER BY random()', contacts_sql)
+
+
+class SchedulerLeaderLeaseTests(unittest.TestCase):
+    """Leader lease: solo un SchedulerWorker hace resume(); peers quedan paused."""
+
+    def setUp(self):
+        naive_mod._SCHED_LEASE_TOKEN = None
+        naive_mod._SCHED_IS_LEADER = False
+        self.mock_scheduler = MagicMock()
+        self.mock_scheduler.running = True
+        self._orig_scheduler = SchedulerWorker.SCHEDULER
+        SchedulerWorker.SCHEDULER = self.mock_scheduler
+
+    def tearDown(self):
+        SchedulerWorker.SCHEDULER = self._orig_scheduler
+        naive_mod._SCHED_LEASE_TOKEN = None
+        naive_mod._SCHED_IS_LEADER = False
+
+    def test_lease_tick_acquire_resumes_scheduler(self):
+        with patch.object(SchedulerWorker, '_lease_acquire', return_value=True):
+            with patch.object(
+                SchedulerWorker, '_make_lease_token', return_value='node-a:tok1',
+            ):
+                SchedulerWorker._leader_lease_tick()
+        self.assertTrue(naive_mod._SCHED_IS_LEADER)
+        self.assertEqual(naive_mod._SCHED_LEASE_TOKEN, 'node-a:tok1')
+        self.mock_scheduler.resume.assert_called_once()
+        self.mock_scheduler.pause.assert_not_called()
+
+    def test_lease_tick_held_by_peer_stays_paused(self):
+        with patch.object(SchedulerWorker, '_lease_acquire', return_value=False):
+            with patch.object(
+                SchedulerWorker, '_make_lease_token', return_value='node-b:tok2',
+            ):
+                SchedulerWorker._leader_lease_tick()
+        self.assertFalse(naive_mod._SCHED_IS_LEADER)
+        self.assertIsNone(naive_mod._SCHED_LEASE_TOKEN)
+        self.mock_scheduler.resume.assert_not_called()
+        self.mock_scheduler.pause.assert_called()
+
+    def test_lease_tick_renew_ok_keeps_leader(self):
+        naive_mod._SCHED_LEASE_TOKEN = 'node-a:tok1'
+        naive_mod._SCHED_IS_LEADER = True
+        with patch.object(SchedulerWorker, '_lease_renew', return_value=True) as renew:
+            with patch.object(SchedulerWorker, '_lease_acquire') as acquire:
+                SchedulerWorker._leader_lease_tick()
+        renew.assert_called_once_with('node-a:tok1')
+        acquire.assert_not_called()
+        self.assertTrue(naive_mod._SCHED_IS_LEADER)
+        self.mock_scheduler.pause.assert_not_called()
+        # Ya era líder: no vuelve a resume
+        self.mock_scheduler.resume.assert_not_called()
+
+    def test_lease_tick_renew_fail_then_reacquire(self):
+        naive_mod._SCHED_LEASE_TOKEN = 'node-a:old'
+        naive_mod._SCHED_IS_LEADER = True
+        with patch.object(SchedulerWorker, '_lease_renew', return_value=False):
+            with patch.object(SchedulerWorker, '_lease_acquire', return_value=True):
+                with patch.object(
+                    SchedulerWorker, '_make_lease_token', return_value='node-a:new',
+                ):
+                    SchedulerWorker._leader_lease_tick()
+        self.assertTrue(naive_mod._SCHED_IS_LEADER)
+        self.assertEqual(naive_mod._SCHED_LEASE_TOKEN, 'node-a:new')
+        self.mock_scheduler.pause.assert_called()
+        self.mock_scheduler.resume.assert_called()
+
+    def test_lease_tick_renew_fail_peer_holds_pauses(self):
+        naive_mod._SCHED_LEASE_TOKEN = 'node-a:old'
+        naive_mod._SCHED_IS_LEADER = True
+        with patch.object(SchedulerWorker, '_lease_renew', return_value=False):
+            with patch.object(SchedulerWorker, '_lease_acquire', return_value=False):
+                with patch.object(
+                    SchedulerWorker, '_make_lease_token', return_value='node-a:new',
+                ):
+                    SchedulerWorker._leader_lease_tick()
+        self.assertFalse(naive_mod._SCHED_IS_LEADER)
+        self.assertIsNone(naive_mod._SCHED_LEASE_TOKEN)
+        self.mock_scheduler.pause.assert_called()
+        self.mock_scheduler.resume.assert_not_called()
+
+    def test_lease_acquire_uses_redis_set_nx(self):
+        mock_redis = MagicMock()
+        mock_redis.set.return_value = True
+        with patch.object(SchedulerWorker, '_redis', return_value=mock_redis):
+            ok = SchedulerWorker._lease_acquire('tok', ttl=15)
+        self.assertTrue(ok)
+        mock_redis.set.assert_called_once_with(
+            SCHEDULER_LEADER_KEY, 'tok', nx=True, ex=15,
+        )
 
 
 if __name__ == '__main__':
