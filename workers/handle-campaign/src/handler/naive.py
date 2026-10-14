@@ -11,6 +11,7 @@ from .utils import timed_lru_cache
 import re
 import json
 import os
+import socket
 import uuid
 import redis
 from psycopg_pool import ConnectionPool
@@ -42,6 +43,9 @@ from settings.default import (
     CHANNEL_AUDIT_INTERVAL_SEC,
     CHANNEL_AUDIT_LOCK_TTL_SEC,
     RESERVE_GRACE_SEC,
+    AUDIT_UP_STREAK_TICKS,
+    AUDIT_DOWN_STREAK_TICKS,
+    AUDIT_IDLE_DOWN_STREAK_TICKS,
     MAX_ABANDON_RATE,
     WARM_UP_SAMPLE_SIZE,
     PREDICTIVE_TICK_MS,
@@ -57,6 +61,7 @@ from settings.default import (
     THROTTLE_STREAK_K,
     THROTTLE_EXIT_RATIO,
 )
+from handler.event_stream import notify_dialer_event
 from handler.predictive_pacer import (
     apply_channel_caps,
     decide_predictive_pace,
@@ -79,6 +84,57 @@ _AUDIT_JOB_REGISTERED = False
 # Flag global para shutdown ordenado
 _SCHED_SHUTDOWN_DONE = False
 
+# Leader lease: un solo SchedulerWorker ejecuta jobs; el resto queda paused
+# pero sigue pudiendo add_job sobre el RedisJobStore compartido (APScheduler 3).
+SCHEDULER_LEADER_KEY = 'OML:HA:SCHEDULER:LEADER'
+SCHEDULER_LEADER_TTL_SEC = 15
+SCHEDULER_LEADER_RENEW_SEC = max(1, SCHEDULER_LEADER_TTL_SEC // 3)
+
+_LEASE_RELEASE_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+else
+  return 0
+end
+"""
+
+_LEASE_RENEW_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('expire', KEYS[1], ARGV[2])
+else
+  return 0
+end
+"""
+
+_SCHED_LEASE_THREAD = None
+_SCHED_LEASE_STOP = threading.Event()
+_SCHED_LEASE_TOKEN = None
+_SCHED_IS_LEADER = False
+_SCHED_LEASE_LOCK = threading.Lock()
+
+
+def _stop_scheduler_leader_lease():
+    """Detiene el hilo de lease y libera el token si somos líderes."""
+    global _SCHED_LEASE_THREAD, _SCHED_LEASE_TOKEN, _SCHED_IS_LEADER
+    _SCHED_LEASE_STOP.set()
+    thread = _SCHED_LEASE_THREAD
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=SCHEDULER_LEADER_RENEW_SEC + 1.0)
+    _SCHED_LEASE_THREAD = None
+
+    token = _SCHED_LEASE_TOKEN
+    if not token:
+        _SCHED_IS_LEADER = False
+        return
+    try:
+        sw = globals().get("SchedulerWorker")
+        if sw is not None:
+            sw._lease_release(token)
+    except Exception:
+        logger.debug("Scheduler lease release on shutdown failed", exc_info=True)
+    _SCHED_LEASE_TOKEN = None
+    _SCHED_IS_LEADER = False
+
 
 def _shutdown_scheduler_gracefully():
     """
@@ -92,6 +148,7 @@ def _shutdown_scheduler_gracefully():
     _SCHED_SHUTDOWN_DONE = True
 
     try:
+        _stop_scheduler_leader_lease()
         sw = globals().get("SchedulerWorker")  # puede no existir aún
         sched = getattr(sw, "SCHEDULER", None) if sw else None
         if sched is None:
@@ -325,6 +382,9 @@ CALLS_DECR_DEDUP_TTL_SEC = int(os.getenv('DIALER_CALLS_DECR_DEDUP_TTL_SEC', '360
 PROCESS_CAMPAIGN_LOCK_TTL_SEC = int(os.getenv('DIALER_PROCESS_CAMPAIGN_LOCK_TTL_SEC', '60'))
 AUDIT_ACTIVE_CHANNELS_JOB = 'audit-active-channels'
 AUDIT_LOCK_KEY = 'OML:CALLS:AUDIT:LOCK'
+ACD_NODES_SET_KEY = 'OML:ACD:NODES'
+AUDIT_STREAK_DIR_UP = 'up'
+AUDIT_STREAK_DIR_DOWN = 'down'
 # Lua: liberar el lock solo si el token sigue siendo el nuestro
 _AUDIT_UNLOCK_LUA = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
@@ -1128,6 +1188,17 @@ class AverageWorker(DialerWorker):
             cls.REDIS_OML_CONNECTION = redis.Redis(
                 host=REDIS_OML_SERVER, port=REDIS_OML_PORT, decode_responses=True, db=0)
 
+
+    @classmethod
+    def _notify_dialer_event(cls, payload):
+        """XADD to OML:STREAM:DIALER (DB 2); optional dual-write PUBLISH."""
+        cls.connect_redis_oml()
+        if isinstance(payload, (bytes, bytearray)):
+            payload = payload.decode('utf-8')
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        notify_dialer_event(payload, publish_conn=cls.REDIS_OML_CONNECTION)
+
     @classmethod
     def connect_redis_dialer(cls):
         if cls.REDIS_DIALER_CONNECTION is None:
@@ -1468,13 +1539,9 @@ class AverageWorker(DialerWorker):
                     cls._init_campaign_channel_phases(id_campaign)
                     cls.REDIS_DIALER_CONNECTION.hset(
                         f'CAMP:{id_campaign}:DISTRIBUTION', 'PRIORITY', priority)
-                    cls.REDIS_OML_CONNECTION.publish(
-                        'OML:CHANNEL:DIALER',
-                        json.dumps({'type': 'CREATE',
+                    cls._notify_dialer_event(json.dumps({'type': 'CREATE',
                                     'camp_id': id_campaign}))
-                    cls.REDIS_OML_CONNECTION.publish(
-                        'OML:CHANNEL:DIALER',
-                        json.dumps({
+                    cls._notify_dialer_event(json.dumps({
                             'type': 'CALLS',
                             'camp_id': id_campaign,
                             'calls': 0,
@@ -1598,9 +1665,7 @@ class AverageWorker(DialerWorker):
             nx=True, ex=PROCESS_CAMPAIGN_LOCK_TTL_SEC)
         if not first_running_job:
             logger.debug(f'Campaign {id_campaign}: is already running')
-            cls.REDIS_OML_CONNECTION.publish(
-                'OML:CHANNEL:DIALER',
-                json.dumps({'type': 'ALREADY_RUNNING',
+            cls._notify_dialer_event(json.dumps({'type': 'ALREADY_RUNNING',
                             'camp_id': id_campaign}))
         return first_running_job
 
@@ -1609,9 +1674,7 @@ class AverageWorker(DialerWorker):
     def start_campaign(cls, worker, job):
         cls.connect_redis_oml()
         if not cls.system_is_active():
-            cls.REDIS_OML_CONNECTION.publish(
-                'OML:CHANNEL:DIALER',
-                json.dumps({'type': 'SYSTEM_STOPPED',
+            cls._notify_dialer_event(json.dumps({'type': 'SYSTEM_STOPPED',
                             'camp_id': 'all'}))
             return b'Forbidden operation'
         data = cls.decode_payload(job.data)
@@ -1753,9 +1816,7 @@ class AverageWorker(DialerWorker):
                 logger.debug(f'Campaign {id_campaign}: campaign expired')
                 cls.set_campaign_status(id_campaign, PAUSED, sync_omnileads=True)
                 cls.connect_redis_oml()
-                cls.REDIS_OML_CONNECTION.publish(
-                    'OML:CHANNEL:DIALER',
-                    json.dumps({'type': 'EXPIRATION',
+                cls._notify_dialer_event(json.dumps({'type': 'EXPIRATION',
                                 'camp_id': id_campaign}))
                 return False
 
@@ -1770,9 +1831,7 @@ class AverageWorker(DialerWorker):
                 )
                 cls.set_campaign_status(id_campaign, FINALIZED, sync_omnileads=True)
                 cls.connect_redis_oml()
-                cls.REDIS_OML_CONNECTION.publish(
-                    'OML:CHANNEL:DIALER',
-                    json.dumps({
+                cls._notify_dialer_event(json.dumps({
                         'type': 'CONTACTS_CONSUMED',
                         'camp_id': id_campaign,
                     }))
@@ -1799,9 +1858,7 @@ class AverageWorker(DialerWorker):
                 logger.debug(f'Campaign {id_campaign}: less than '
                              f'{PERCENTAGE_PENDING_CALL_THRESHOLD}% contacts pending for call')
                 cls.connect_redis_oml()
-                cls.REDIS_OML_CONNECTION.publish(
-                    'OML:CHANNEL:DIALER',
-                    json.dumps({
+                cls._notify_dialer_event(json.dumps({
                         'type': 'ALMOST_NO_CONTACTS',
                         'camp_id': id_campaign,
                     }))
@@ -2243,12 +2300,9 @@ class AverageWorker(DialerWorker):
             if created:
                 try:
                     cls.connect_redis_oml()
-                    cls.REDIS_OML_CONNECTION.publish(
-                        'OML:CHANNEL:DIALER',
-                        json.dumps(
+                    cls._notify_dialer_event(json.dumps(
                             {'type': 'CALLS', 'camp_id':
-                             id_campaign, 'calls': 0}
-                        )
+                             id_campaign, 'calls': 0})
                     )
                 except Exception as e:
                     logger.debug('Publish init CALLS failed: %s', e)
@@ -2439,7 +2493,7 @@ class AverageWorker(DialerWorker):
     @classmethod
     def _publish_calls_count(cls, id_campaign: int) -> None:
         """
-        Publica el valor actual de OML:CALLS:{id_campaign}:DIALER en OML:CHANNEL:DIALER
+        Publica el valor actual de OML:CALLS:{id_campaign}:DIALER en OML:STREAM:DIALER
         para que la supervisión actualice "Canales discando" en tiempo real.
         """
         try:
@@ -2454,9 +2508,7 @@ class AverageWorker(DialerWorker):
                 except (TypeError, ValueError):
                     count = 0
             cls.connect_redis_oml()
-            cls.REDIS_OML_CONNECTION.publish(
-                'OML:CHANNEL:DIALER',
-                json.dumps({'type': 'CALLS', 'camp_id': id_campaign, 'calls': count})
+            cls._notify_dialer_event(json.dumps({'type': 'CALLS', 'camp_id': id_campaign, 'calls': count})
             )
         except Exception as e:
             logger.debug('Publish CALLS count failed camp %s: %s', id_campaign, e)
@@ -2844,88 +2896,224 @@ class AverageWorker(DialerWorker):
             return row[0]
 
     @classmethod
-    def _fetch_asterisk_dialer_channel_counts(cls):
+    def _acd_node_heartbeat_key(cls, node_id):
+        return f'OML:ACD:NODE:{node_id}:HB'
+
+    @classmethod
+    def _acd_node_channels_key(cls, node_id):
+        return f'OML:ACD:{node_id}:CHANNELS'
+
+    @classmethod
+    def _acd_node_ringing_key(cls, node_id):
+        return f'OML:ACD:{node_id}:RINGING'
+
+    @classmethod
+    def _audit_streak_key(cls, camp_id, kind='calls'):
+        if kind == 'ringing':
+            return f'OML:CALLS:AUDIT:STREAK:RINGING:{camp_id}'
+        return f'OML:CALLS:AUDIT:STREAK:{camp_id}'
+
+    @classmethod
+    def _decode_redis_str(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            return value.decode('utf-8', errors='replace')
+        return str(value)
+
+    @classmethod
+    def _sum_hash_by_camp(cls, hash_data, into):
+        """Acumula hash Redis camp_id→count sobre dict int→int."""
+        if not hash_data:
+            return
+        for raw_k, raw_v in hash_data.items():
+            try:
+                camp_id = int(cls._decode_redis_str(raw_k))
+                count = int(cls._decode_redis_str(raw_v) or 0)
+            except (TypeError, ValueError):
+                continue
+            if camp_id <= 0:
+                continue
+            into[camp_id] = into.get(camp_id, 0) + max(0, count)
+
+    @classmethod
+    def _fetch_acd_snapshot_counts(cls):
         """
-        Invoca job sync audit-dialer-channels en ACD.
-        Retorna (ok, {camp_id: count}, ringing_or_None).
-        ringing=None si el envelope no trae el campo (ACD viejo / deploy mixto).
-        ok=False => no reconciliar Redis.
+        Suma fotos publicadas por acd-channel-audit en Redis DB3.
+
+        Retorna (cluster_complete, counts, ringing).
+        - NODES vacío o excepción → (False, {}, {}): no reconciliar.
+        - Nodo sin heartbeat → cluster incompleto; su foto no entra en la suma.
+        - Suma parcial (incompleto) sirve como cota inferior para undercount.
         """
         try:
-            client = cls._get_gearman_client()
-            completed = client.submit_job(
-                'audit-dialer-channels',
-                b'{}',
-                background=False,
-                wait_until_complete=True,
-                poll_timeout=10.0,
+            cls.connect_redis_dialer()
+            r = cls.REDIS_DIALER_CONNECTION
+            raw_nodes = r.smembers(ACD_NODES_SET_KEY) or set()
+            nodes = {
+                cls._decode_redis_str(n)
+                for n in raw_nodes
+                if cls._decode_redis_str(n)
+            }
+            if not nodes:
+                logger.warning(
+                    'ACD snapshot audit: OML:ACD:NODES empty; skip reconcile',
+                )
+                return False, {}, {}
+
+            fresh_nodes = []
+            stale_nodes = []
+            for node_id in nodes:
+                hb = r.get(cls._acd_node_heartbeat_key(node_id))
+                if hb is None:
+                    stale_nodes.append(node_id)
+                else:
+                    fresh_nodes.append(node_id)
+
+            counts = {}
+            ringing = {}
+            for node_id in fresh_nodes:
+                cls._sum_hash_by_camp(
+                    r.hgetall(cls._acd_node_channels_key(node_id)) or {},
+                    counts,
+                )
+                cls._sum_hash_by_camp(
+                    r.hgetall(cls._acd_node_ringing_key(node_id)) or {},
+                    ringing,
+                )
+
+            cluster_complete = len(stale_nodes) == 0 and len(fresh_nodes) > 0
+            if stale_nodes:
+                logger.info(
+                    'ACD snapshot audit: incomplete cluster stale=%s fresh=%s',
+                    stale_nodes, fresh_nodes,
+                )
+            return cluster_complete, counts, ringing
+        except Exception as e:
+            logger.error(
+                'Failed to fetch ACD snapshot channel counts: %s', e, exc_info=True,
             )
-            if not completed:
-                return False, {}, None
-            # python-gearman expone la respuesta del worker en ``result``.
-            # Mantener ``data`` como fallback para versiones/implementaciones
-            # que devuelven allí el payload completado.
-            raw = getattr(completed, 'result', None)
-            if raw is None:
-                raw = getattr(completed, 'data', None)
-            if not raw:
-                return False, {}, None
+            return False, {}, {}
+
+    @classmethod
+    def _get_audit_streak(cls, camp_id, kind='calls'):
+        cls.connect_redis_dialer()
+        raw = cls.REDIS_DIALER_CONNECTION.get(cls._audit_streak_key(camp_id, kind))
+        if not raw:
+            return None
+        try:
             if isinstance(raw, bytes):
                 raw = raw.decode('utf-8')
             data = json.loads(raw)
             if not isinstance(data, dict):
-                return False, {}, None
-            # Envelope nuevo: {"ok": true/false, "counts": {...}, "ringing"?: {...}}
-            if 'ok' in data:
-                if not data.get('ok'):
-                    return False, {}, None
-                counts_raw = data.get('counts') or {}
-                if not isinstance(counts_raw, dict):
-                    return False, {}, None
-                counts = {int(k): int(v) for k, v in counts_raw.items()}
-                ringing = None
-                if 'ringing' in data:
-                    ringing_raw = data.get('ringing') or {}
-                    if isinstance(ringing_raw, dict):
-                        ringing = {int(k): int(v) for k, v in ringing_raw.items()}
-                    else:
-                        ringing = {}
-                return True, counts, ringing
-            # Compat deploy mixto: dict plano {camp: count}
-            return True, {int(k): int(v) for k, v in data.items()}, None
-        except Exception as e:
-            logger.error(
-                'Failed to fetch asterisk dialer channel counts: %s', e, exc_info=True,
-            )
-        return False, {}, None
+                return None
+            direction = data.get('dir')
+            if direction not in (AUDIT_STREAK_DIR_UP, AUDIT_STREAK_DIR_DOWN):
+                return None
+            return {
+                'dir': direction,
+                'n': max(0, int(data.get('n') or 0)),
+                'observed': max(0, int(data.get('observed') or 0)),
+            }
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
 
     @classmethod
-    def _reconcile_campaign_ringing_bucket(cls, camp_id, ringing_target, total_target):
+    def _clear_audit_streak(cls, camp_id, kind='calls'):
+        cls.connect_redis_dialer()
+        cls.REDIS_DIALER_CONNECTION.delete(cls._audit_streak_key(camp_id, kind))
+
+    @classmethod
+    def _bump_audit_streak(cls, camp_id, direction, observed, kind='calls'):
         """
-        Ajusta CAMP:{camp}:CHANNELS RINGING al valor Asterisk y loguea drift
-        de WAITING_AGENT/ONCALL respecto del total.
+        Incrementa streak si la dirección continúa; si no, reinicia en 1.
+        Para ``up``: reinicia si observed bajó respecto del streak previo.
+        Retorna el nuevo n.
+        """
+        observed = max(0, int(observed))
+        prev = cls._get_audit_streak(camp_id, kind)
+        if (
+            prev
+            and prev['dir'] == direction
+            and (
+                direction != AUDIT_STREAK_DIR_UP
+                or observed >= prev['observed']
+            )
+        ):
+            n = prev['n'] + 1
+        else:
+            n = 1
+        payload = json.dumps({
+            'dir': direction,
+            'n': n,
+            'observed': observed,
+        })
+        cls.REDIS_DIALER_CONNECTION.set(
+            cls._audit_streak_key(camp_id, kind), payload, ex=3600,
+        )
+        return n
+
+    @classmethod
+    def _reconcile_campaign_ringing_bucket(
+        cls, camp_id, ringing_target, total_target, cluster_complete,
+    ):
+        """
+        Ajusta CAMP:{camp}:CHANNELS RINGING con histéresis asimétrica
+        y loguea drift de WAITING_AGENT/ONCALL respecto del total.
         """
         channels_key = cls._channels_hash_key(camp_id)
         phases = cls.get_campaign_channel_phases(camp_id)
         redis_ringing = phases[PHASE_RINGING]
-        if redis_ringing != ringing_target:
-            if (
-                redis_ringing > ringing_target
-                and cls._campaign_has_recent_reserve(camp_id)
-            ):
+        ringing_target = max(0, int(ringing_target))
+
+        if redis_ringing == ringing_target:
+            cls._clear_audit_streak(camp_id, kind='ringing')
+        elif redis_ringing < ringing_target:
+            n = cls._bump_audit_streak(
+                camp_id, AUDIT_STREAK_DIR_UP, ringing_target, kind='ringing',
+            )
+            if n >= AUDIT_UP_STREAK_TICKS:
+                logger.warning(
+                    'Audit corrected RINGING camp %s: redis=%s asterisk=%s '
+                    '(up streak=%s)',
+                    camp_id, redis_ringing, ringing_target, n,
+                )
+                cls.REDIS_DIALER_CONNECTION.hset(
+                    channels_key, PHASE_RINGING, ringing_target,
+                )
+                cls._clear_audit_streak(camp_id, kind='ringing')
+        else:
+            # redis_ringing > ringing_target
+            if not cluster_complete:
+                cls._clear_audit_streak(camp_id, kind='ringing')
+                logger.debug(
+                    'Audit: skip RINGING down camp %s (incomplete cluster) '
+                    'redis=%s asterisk=%s',
+                    camp_id, redis_ringing, ringing_target,
+                )
+            elif cls._campaign_has_recent_reserve(camp_id):
+                cls._clear_audit_streak(camp_id, kind='ringing')
                 logger.debug(
                     'Audit: skip RINGING camp %s (recent reserve) '
                     'redis=%s asterisk=%s',
                     camp_id, redis_ringing, ringing_target,
                 )
             else:
-                logger.warning(
-                    'Audit corrected RINGING camp %s: redis=%s asterisk=%s',
-                    camp_id, redis_ringing, ringing_target,
+                n = cls._bump_audit_streak(
+                    camp_id, AUDIT_STREAK_DIR_DOWN, ringing_target,
+                    kind='ringing',
                 )
-                cls.REDIS_DIALER_CONNECTION.hset(
-                    channels_key, PHASE_RINGING, max(0, int(ringing_target)),
-                )
+                if n >= AUDIT_DOWN_STREAK_TICKS:
+                    logger.warning(
+                        'Audit corrected RINGING camp %s: redis=%s asterisk=%s '
+                        '(down streak=%s)',
+                        camp_id, redis_ringing, ringing_target, n,
+                    )
+                    cls.REDIS_DIALER_CONNECTION.hset(
+                        channels_key, PHASE_RINGING, ringing_target,
+                    )
+                    cls._clear_audit_streak(camp_id, kind='ringing')
+
         phases_after = cls.get_campaign_channel_phases(camp_id)
         non_ringing = (
             phases_after[PHASE_WAITING_AGENT] + phases_after[PHASE_ONCALL]
@@ -3766,9 +3954,7 @@ class AverageWorker(DialerWorker):
     def resume_campaign(cls, worker, job):
         cls.connect_redis_oml()
         if not cls.system_is_active():
-            cls.REDIS_OML_CONNECTION.publish(
-                'OML:CHANNEL:DIALER',
-                json.dumps({'type': 'SYSTEM_STOPPED',
+            cls._notify_dialer_event(json.dumps({'type': 'SYSTEM_STOPPED',
                             'camp_id': 'all'}))
             return b'Forbidden operation'
         data = cls.decode_payload(job.data)
@@ -4353,9 +4539,7 @@ class AverageWorker(DialerWorker):
             cls._clear_campaign_channel_phases(id_campaign)
             cls.update_percentages_priority_campaigns()
             # TODO: remove the remaining data in Redis
-            cls.REDIS_OML_CONNECTION.publish(
-                'OML:CHANNEL:DIALER',
-                json.dumps({'type': 'DELETE',
+            cls._notify_dialer_event(json.dumps({'type': 'DELETE',
                             'camp_id': id_campaign}))
         try:
             cls.get_boost_factor.cache_clear()
@@ -4418,9 +4602,7 @@ class AverageWorker(DialerWorker):
 
         # 4. Publish the change (logic unchanged)
         cls.connect_redis_oml()
-        cls.REDIS_OML_CONNECTION.publish(
-            "OML:CHANNEL:DIALER",
-            json.dumps({'type': 'STATUSCHANGE',
+        cls._notify_dialer_event(json.dumps({'type': 'STATUSCHANGE',
                         'camp_id': id_campaign,
                         'status': new_status,
                         'admin': AdminRender.render_status_change(
@@ -4501,9 +4683,7 @@ class AverageWorker(DialerWorker):
             stats = cls.REDIS_DIALER_CONNECTION.hgetall(f'CAMP:{id_campaign}:COUNTER')
             logger.debug(f'Report for campaign {id_campaign}: {stats}')
             cls.connect_redis_oml()
-            cls.REDIS_OML_CONNECTION.publish(
-                'OML:CHANNEL:DIALER',
-                json.dumps({
+            cls._notify_dialer_event(json.dumps({
                     'type': 'EVENT',
                     'camp_id': id_campaign,
                     'data': ari_event_data
@@ -4518,9 +4698,7 @@ class AverageWorker(DialerWorker):
             changed_stats.update({'admin': AdminRender.render_stats_inner(
                 id_campaign, stats)})
             changed_stats_json = json.dumps(changed_stats)
-            cls.REDIS_OML_CONNECTION.publish(
-                'OML:CHANNEL:DIALER',
-                changed_stats_json)
+            cls._notify_dialer_event(changed_stats_json)
             cls.update_prev_stats(id_campaign)
             # for Postgres in Omnidialer
             stats_json = json.dumps(stats)
@@ -4598,37 +4776,38 @@ class AverageWorker(DialerWorker):
     @classmethod
     def audit_active_channels(cls):
         """
-        Reconcilia OML:CALLS:{camp}:DIALER con canales dialer PSTN reales en Asterisk (vía ACD).
-        Si el envelope trae ``ringing``, también reconcilia CAMP:{camp}:CHANNELS RINGING.
-        Solo corrige cuando la consulta ACD reporta ok=True (no interpreta fallo como cero).
+        Reconcilia OML:CALLS:{camp}:DIALER con la suma de fotos ACD en Redis DB3.
+
+        Histéresis asimétrica: subir tras AUDIT_UP_STREAK_TICKS (cota inferior OK
+        con cluster incompleto); bajar solo con cluster completo + streak más largo
+        y sin reserva reciente. No interpreta NODES vacío como cero.
         """
         logger.info("Iniciando auditoría de canales activos (Sanity Check)...")
 
         try:
-            fetched = cls._fetch_asterisk_dialer_channel_counts()
-            # Compat mocks/tests antiguos que aún retornan 2-tupla
-            if len(fetched) == 2:
-                ok, asterisk_counts = fetched
-                asterisk_ringing = None
-            else:
-                ok, asterisk_counts, asterisk_ringing = fetched
-            if not ok:
+            cluster_complete, asterisk_counts, asterisk_ringing = (
+                cls._fetch_acd_snapshot_counts()
+            )
+            # NODES vacío / error de lectura → counts vacíos y incomplete.
+            # Sin nodos registrados no hay señal confiable: no tocar.
+            cls.connect_redis_dialer()
+            nodes = cls.REDIS_DIALER_CONNECTION.smembers(ACD_NODES_SET_KEY) or set()
+            if not nodes:
                 logger.warning(
-                    "Auditoría omitida: conteo Asterisk no confiable (ok=false). "
+                    "Auditoría omitida: sin nodos ACD registrados. "
                     "No se modifica OML:CALLS."
                 )
                 return
 
-            cls.connect_redis_dialer()
             redis_keys = cls.REDIS_DIALER_CONNECTION.keys('OML:CALLS:*:DIALER') or []
 
             camps_to_check = set(asterisk_counts.keys())
-            if asterisk_ringing:
-                camps_to_check.update(asterisk_ringing.keys())
+            camps_to_check.update(asterisk_ringing.keys())
             for key in redis_keys:
                 try:
-                    camps_to_check.add(int(key.split(':')[2]))
-                except (IndexError, ValueError):
+                    key_s = cls._decode_redis_str(key)
+                    camps_to_check.add(int(key_s.split(':')[2]))
+                except (IndexError, ValueError, TypeError):
                     continue
 
             corrections = 0
@@ -4639,58 +4818,92 @@ class AverageWorker(DialerWorker):
                     redis_count = int(redis_raw or 0)
                 except (TypeError, ValueError):
                     redis_count = 0
-                asterisk_count = int(asterisk_counts.get(camp_id, 0))
+                observed = int(asterisk_counts.get(camp_id, 0))
                 dialer_status = cls._get_campaign_dialer_status(camp_id)
                 campaign_active = dialer_status == ACTIVE
 
-                should_correct = False
-                target = asterisk_count
-
-                if not campaign_active and redis_count > 0:
-                    should_correct = True
-                    target = asterisk_count
-                elif redis_count > asterisk_count:
-                    if cls._campaign_has_recent_reserve(camp_id):
-                        logger.debug(
-                            'Audit: skip camp %s (recent reserve) redis=%s asterisk=%s',
-                            camp_id, redis_count, asterisk_count,
+                if redis_count == observed:
+                    cls._clear_audit_streak(camp_id, kind='calls')
+                elif redis_count < observed:
+                    # Undercount → over-dial risk; allow partial cluster as lower bound
+                    n = cls._bump_audit_streak(
+                        camp_id, AUDIT_STREAK_DIR_UP, observed, kind='calls',
+                    )
+                    if n >= AUDIT_UP_STREAK_TICKS:
+                        logger.warning(
+                            'Audit corrected camp %s: redis=%s asterisk=%s '
+                            'status=%s -> set %s (up streak=%s complete=%s)',
+                            camp_id, redis_count, observed, dialer_status,
+                            observed, n, cluster_complete,
                         )
-                        if asterisk_ringing is not None:
-                            cls._reconcile_campaign_ringing_bucket(
-                                camp_id,
-                                int(asterisk_ringing.get(camp_id, 0)),
-                                redis_count,
+                        cls.REDIS_DIALER_CONNECTION.set(key, observed)
+                        cls._publish_calls_count(camp_id)
+                        corrections += 1
+                        redis_count = observed
+                        cls._clear_audit_streak(camp_id, kind='calls')
+                else:
+                    # redis_count > observed (ghost / overcount)
+                    can_down = False
+                    down_needed = AUDIT_DOWN_STREAK_TICKS
+                    if not campaign_active and redis_count > 0:
+                        if cluster_complete:
+                            can_down = True
+                            down_needed = AUDIT_IDLE_DOWN_STREAK_TICKS
+                        else:
+                            cls._clear_audit_streak(camp_id, kind='calls')
+                            logger.debug(
+                                'Audit: skip idle camp %s down (incomplete cluster) '
+                                'redis=%s asterisk=%s',
+                                camp_id, redis_count, observed,
                             )
-                        continue
-                    should_correct = True
-                    target = asterisk_count
-                elif redis_count < asterisk_count:
-                    # Undercount: Redis por debajo de canales reales → over-dial si no se corrige
-                    should_correct = True
-                    target = asterisk_count
+                    elif campaign_active:
+                        if not cluster_complete:
+                            cls._clear_audit_streak(camp_id, kind='calls')
+                            logger.debug(
+                                'Audit: skip camp %s down (incomplete cluster) '
+                                'redis=%s asterisk=%s',
+                                camp_id, redis_count, observed,
+                            )
+                        elif cls._campaign_has_recent_reserve(camp_id):
+                            cls._clear_audit_streak(camp_id, kind='calls')
+                            logger.debug(
+                                'Audit: skip camp %s (recent reserve) '
+                                'redis=%s asterisk=%s',
+                                camp_id, redis_count, observed,
+                            )
+                        else:
+                            can_down = True
+                            down_needed = AUDIT_DOWN_STREAK_TICKS
 
-                if should_correct and redis_count != target:
-                    logger.warning(
-                        'Audit corrected camp %s: redis=%s asterisk=%s status=%s -> set %s',
-                        camp_id, redis_count, asterisk_count, dialer_status, target,
-                    )
-                    cls.REDIS_DIALER_CONNECTION.set(key, target)
-                    cls._publish_calls_count(camp_id)
-                    corrections += 1
-                    redis_count = target
+                    if can_down:
+                        n = cls._bump_audit_streak(
+                            camp_id, AUDIT_STREAK_DIR_DOWN, observed,
+                            kind='calls',
+                        )
+                        if n >= down_needed:
+                            logger.warning(
+                                'Audit corrected camp %s: redis=%s asterisk=%s '
+                                'status=%s -> set %s (down streak=%s)',
+                                camp_id, redis_count, observed, dialer_status,
+                                observed, n,
+                            )
+                            cls.REDIS_DIALER_CONNECTION.set(key, observed)
+                            cls._publish_calls_count(camp_id)
+                            corrections += 1
+                            redis_count = observed
+                            cls._clear_audit_streak(camp_id, kind='calls')
 
-                if asterisk_ringing is not None:
-                    cls._reconcile_campaign_ringing_bucket(
-                        camp_id,
-                        int(asterisk_ringing.get(camp_id, 0)),
-                        redis_count,
-                    )
+                cls._reconcile_campaign_ringing_bucket(
+                    camp_id,
+                    int(asterisk_ringing.get(camp_id, 0)),
+                    redis_count,
+                    cluster_complete,
+                )
 
             logger.info(
                 "Auditoría completada (%s correcciones, asterisk_camps=%s, "
-                "ringing_field=%s).",
-                corrections, len(asterisk_counts),
-                asterisk_ringing is not None,
+                "cluster_complete=%s).",
+                corrections, len(asterisk_counts), cluster_complete,
             )
 
         except Exception as e:
@@ -4948,9 +5161,7 @@ class AverageWorker(DialerWorker):
         # **mantener Redis en sync** después del bulk
         cls.rebuild_active_campaigns_set()
         cls.connect_redis_oml()
-        cls.REDIS_OML_CONNECTION.publish(
-            "OML:CHANNEL:DIALER",
-            json.dumps({'type': 'PAUSE_BULK', 'camp_id': 'all'})
+        cls._notify_dialer_event(json.dumps({'type': 'PAUSE_BULK', 'camp_id': 'all'})
         )
 
     @classmethod
@@ -4981,9 +5192,7 @@ class AverageWorker(DialerWorker):
         action = data['action']
         cls.handle_dialer_action(action)
         cls.connect_redis_oml()
-        cls.REDIS_OML_CONNECTION.publish(
-            'OML:CHANNEL:DIALER',
-            json.dumps({'type': 'DIALER_STATUS_CHANGE',
+        cls._notify_dialer_event(json.dumps({'type': 'DIALER_STATUS_CHANGE',
                         'action': action,
                         'camp_id': 'all'})
         )
@@ -5033,6 +5242,146 @@ class SchedulerWorker(AverageWorker):
     @staticmethod
     def _camp_seen_key(camp_id: int) -> str:
         return f"CAMP:{camp_id}:SCHED:SEEN"
+
+    # ---------- Leader lease (APScheduler 3 + RedisJobStore compartido) ----------
+    @staticmethod
+    def _scheduler_node_id() -> str:
+        configured = os.environ.get('OML_NODE_ID', '').strip()
+        if configured:
+            return configured
+        return socket.gethostname()
+
+    @classmethod
+    def _make_lease_token(cls) -> str:
+        return f'{cls._scheduler_node_id()}:{uuid.uuid4().hex}'
+
+    @classmethod
+    def _lease_acquire(cls, token: str, ttl: int = SCHEDULER_LEADER_TTL_SEC) -> bool:
+        try:
+            return bool(cls._redis().set(
+                SCHEDULER_LEADER_KEY, token, nx=True, ex=int(ttl),
+            ))
+        except Exception:
+            logger.exception('Scheduler lease acquire failed key=%s', SCHEDULER_LEADER_KEY)
+            return False
+
+    @classmethod
+    def _lease_renew(cls, token: str, ttl: int = SCHEDULER_LEADER_TTL_SEC) -> bool:
+        try:
+            return bool(cls._redis().eval(
+                _LEASE_RENEW_LUA, 1, SCHEDULER_LEADER_KEY, token, int(ttl),
+            ))
+        except Exception:
+            logger.exception('Scheduler lease renew failed key=%s', SCHEDULER_LEADER_KEY)
+            return False
+
+    @classmethod
+    def _lease_release(cls, token: str) -> bool:
+        try:
+            return bool(cls._redis().eval(
+                _LEASE_RELEASE_LUA, 1, SCHEDULER_LEADER_KEY, token,
+            ))
+        except Exception:
+            logger.exception('Scheduler lease release failed key=%s', SCHEDULER_LEADER_KEY)
+            return False
+
+    @classmethod
+    def _become_scheduler_leader(cls, token: str):
+        global _SCHED_LEASE_TOKEN, _SCHED_IS_LEADER
+        _SCHED_LEASE_TOKEN = token
+        if not _SCHED_IS_LEADER:
+            _SCHED_IS_LEADER = True
+            try:
+                if cls.SCHEDULER.running:
+                    cls.SCHEDULER.resume()
+            except Exception:
+                logger.exception('Scheduler resume as leader failed')
+            logger.info(
+                'Scheduler leader acquired key=%s node=%s',
+                SCHEDULER_LEADER_KEY, cls._scheduler_node_id(),
+            )
+
+    @classmethod
+    def _relinquish_scheduler_leader(cls, reason: str):
+        global _SCHED_LEASE_TOKEN, _SCHED_IS_LEADER
+        was_leader = _SCHED_IS_LEADER
+        _SCHED_LEASE_TOKEN = None
+        _SCHED_IS_LEADER = False
+        try:
+            if cls.SCHEDULER.running:
+                cls.SCHEDULER.pause()
+        except Exception:
+            logger.exception('Scheduler pause as follower failed')
+        if was_leader:
+            logger.info(
+                'Scheduler leader lost (%s) key=%s node=%s',
+                reason, SCHEDULER_LEADER_KEY, cls._scheduler_node_id(),
+            )
+        elif reason == 'held_by_peer':
+            logger.debug(
+                'Scheduler follower (lease held by peer) key=%s node=%s',
+                SCHEDULER_LEADER_KEY, cls._scheduler_node_id(),
+            )
+
+    @classmethod
+    def _leader_lease_tick(cls):
+        """Intenta adquirir o renovar el lease; resume/pause según resultado."""
+        global _SCHED_LEASE_TOKEN
+        with _SCHED_LEASE_LOCK:
+            token = _SCHED_LEASE_TOKEN
+            if token:
+                if cls._lease_renew(token):
+                    cls._become_scheduler_leader(token)
+                    return
+                cls._relinquish_scheduler_leader('renew_failed')
+            new_token = cls._make_lease_token()
+            if cls._lease_acquire(new_token):
+                cls._become_scheduler_leader(new_token)
+            else:
+                cls._relinquish_scheduler_leader('held_by_peer')
+
+    @classmethod
+    def _leader_lease_loop(cls):
+        while not _SCHED_LEASE_STOP.is_set():
+            try:
+                cls._leader_lease_tick()
+            except Exception:
+                logger.exception('Scheduler leader lease tick failed')
+            _SCHED_LEASE_STOP.wait(SCHEDULER_LEADER_RENEW_SEC)
+
+    @classmethod
+    def _start_leader_lease_once(cls):
+        """Arranca el hilo daemon de lease una sola vez por proceso."""
+        global _SCHED_LEASE_THREAD
+        with _SCHED_LEASE_LOCK:
+            if _SCHED_LEASE_THREAD is not None and _SCHED_LEASE_THREAD.is_alive():
+                return
+            _SCHED_LEASE_STOP.clear()
+            thread = threading.Thread(
+                target=cls._leader_lease_loop,
+                name='scheduler-leader-lease',
+                daemon=True,
+            )
+            _SCHED_LEASE_THREAD = thread
+            thread.start()
+            logger.info(
+                'Scheduler leader lease thread started key=%s ttl=%ss renew=%ss',
+                SCHEDULER_LEADER_KEY, SCHEDULER_LEADER_TTL_SEC, SCHEDULER_LEADER_RENEW_SEC,
+            )
+
+    @classmethod
+    def _ensure_scheduler_started(cls):
+        """
+        Arranca APScheduler en paused y deja que el lease decida quién hace resume().
+
+        Todos los nodos pueden add_job sobre el RedisJobStore; solo el líder ejecuta.
+        """
+        cls._register_listener_once()
+        if not cls.SCHEDULER.running:
+            cls.SCHEDULER.start(paused=True)
+            logger.info('Scheduler started paused=True (awaiting leader lease)')
+        cls._start_leader_lease_once()
+        cls._register_audit_job_once()
 
     # ---------- Helpers de extracción ----------
     @classmethod
@@ -5225,8 +5574,6 @@ class SchedulerWorker(AverageWorker):
             logger.info("CHANNEL_AUDIT_INTERVAL_SEC=%s: audit job deshabilitado", interval)
             _AUDIT_JOB_REGISTERED = True
             return
-        if not cls.SCHEDULER.running:
-            cls.SCHEDULER.start(paused=False)
         job_id = 'audit_dialer_channels'
         cls.SCHEDULER.add_job(
             cls._enqueue_audit_active_channels,
@@ -5247,12 +5594,9 @@ class SchedulerWorker(AverageWorker):
     def start_periodic_jobs(cls):
         """
         Inicializa APScheduler y jobs periódicos al arrancar el worker scheduler.
-        Independiente de schedule-agenda.
+        Independiente de schedule-agenda. Solo el líder del lease ejecuta jobs.
         """
-        cls._register_listener_once()
-        cls._register_audit_job_once()
-        if not cls.SCHEDULER.running:
-            cls.SCHEDULER.start(paused=False)
+        cls._ensure_scheduler_started()
 
     # ---------- Funciones ejecutadas por los jobs ----------
     @classmethod
@@ -5302,9 +5646,7 @@ class SchedulerWorker(AverageWorker):
     @classmethod
     @job_handler_decorator
     def schedule_agenda(cls, worker, job):
-        cls._register_listener_once()
-        if not cls.SCHEDULER.running:
-            cls.SCHEDULER.start(paused=False)
+        cls._ensure_scheduler_started()
 
         data = cls.decode_payload(job.data)
         id_campaign = int(data['id_campaign'])
