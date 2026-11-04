@@ -17,6 +17,9 @@ MODE_PREDICTIVE = 'predictive'
 MODE_THROTTLED = 'throttled'  # latched kill-switch → progressive R=1
 MODE_PROGRESSIVE_FALLBACK = 'progressive_fallback'
 
+# Soft hold must not overdial above 1× net agent capacity.
+SOFT_HOLD_MAX_RATIO = 1.0
+
 
 def compute_gamma(
         drop_rate: Optional[float],
@@ -74,6 +77,23 @@ def compute_gamma(
     return agg + t * (floor_g - agg)
 
 
+def _net_agent_capacity(a_free: float, a_expected: float, c_waiting: float) -> float:
+    """A = max(0, a_free + a_expected - c_waiting)."""
+    try:
+        a_free_f = max(0.0, float(a_free or 0.0))
+    except (TypeError, ValueError):
+        a_free_f = 0.0
+    try:
+        a_exp_f = max(0.0, float(a_expected or 0.0))
+    except (TypeError, ValueError):
+        a_exp_f = 0.0
+    try:
+        waiting_f = max(0.0, float(c_waiting or 0.0))
+    except (TypeError, ValueError):
+        waiting_f = 0.0
+    return max(0.0, a_free_f + a_exp_f - waiting_f)
+
+
 def compute_c_dial(
         a_free: float,
         a_expected: float,
@@ -81,9 +101,18 @@ def compute_c_dial(
         p_hit: float,
         gamma: float,
         p_hit_floor: float = 0.05,
+        c_waiting: float = 0.0,
 ) -> int:
     """
-    C_dial = max(0, floor(((A_free + A_expected - C_ringing * P_hit) / P_hit) * gamma))
+    Calcula cuántos canales nuevos originar en el tick predictivo.
+
+    Capacidad neta A = max(0, a_free + a_expected - c_waiting)
+    (WAITING_AGENT ya compromete agentes READY, igual que en progresivo).
+
+      - Si gamma > 1.0 (boost / agresividad > 1):
+        (A * gamma - C_ringing * P_hit) / P_hit
+      - Si gamma <= 1.0 (neutral o amortiguación por drop rate):
+        ((A - C_ringing * P_hit) / P_hit) * gamma
     """
     try:
         p = float(p_hit)
@@ -104,21 +133,55 @@ def compute_c_dial(
     if g <= 0:
         return 0
 
-    try:
-        a_free_f = max(0.0, float(a_free or 0.0))
-    except (TypeError, ValueError):
-        a_free_f = 0.0
-    try:
-        a_exp_f = max(0.0, float(a_expected or 0.0))
-    except (TypeError, ValueError):
-        a_exp_f = 0.0
+    a_net = _net_agent_capacity(a_free, a_expected, c_waiting)
     try:
         ringing_f = max(0.0, float(c_ringing or 0.0))
     except (TypeError, ValueError):
         ringing_f = 0.0
 
-    raw = ((a_free_f + a_exp_f - ringing_f * p) / p) * g
+    if g > 1.0:
+        raw = ((a_net * g) - ringing_f * p) / p
+    else:
+        raw = ((a_net - ringing_f * p) / p) * g
     return max(0, int(floor(raw)))
+
+
+def apply_dial_ratio_cap(
+        c_dial: int,
+        a_free: float,
+        a_expected: float,
+        c_ringing: float,
+        max_ratio: float,
+        c_waiting: float = 0.0,
+) -> int:
+    """
+    Tope duro de sobremarcado: C_dial ≤ floor(A * max_ratio) - C_ringing.
+
+    max_ratio <= 0 → no-op (rollback / desactivado).
+    """
+    try:
+        ratio = float(max_ratio)
+    except (TypeError, ValueError):
+        return max(0, int(c_dial or 0))
+    if ratio <= 0:
+        try:
+            return max(0, int(c_dial))
+        except (TypeError, ValueError):
+            return 0
+
+    a_net = _net_agent_capacity(a_free, a_expected, c_waiting)
+    try:
+        ringing_f = max(0.0, float(c_ringing or 0.0))
+    except (TypeError, ValueError):
+        ringing_f = 0.0
+
+    max_slots = int(floor(a_net * ratio)) - int(floor(ringing_f))
+    max_slots = max(0, max_slots)
+    try:
+        dial = int(c_dial)
+    except (TypeError, ValueError):
+        dial = 0
+    return max(0, min(dial, max_slots))
 
 
 def decide_predictive_pace(
@@ -134,6 +197,8 @@ def decide_predictive_pace(
         p_hit_floor: float = 0.05,
         gamma_floor: float = 0.2,
         force_throttle: bool = False,
+        c_waiting: float = 0.0,
+        max_dial_ratio: float = 5.0,
 ) -> Dict[str, Any]:
     """
     Decide pacing action for a predictive campaign tick.
@@ -144,7 +209,8 @@ def decide_predictive_pace(
       use_progressive_r1: bool — caller should dial with progressive boost=1.0
 
     force_throttle: hard kill-switch (streak ≥ K / latch) → progressive R=1.
-    Si D ≥ D_max y no force_throttle: soft hold con γ = gamma_floor.
+    Si D ≥ D_max y no force_throttle: soft hold con γ = gamma_floor y ratio ≤ 1×.
+    max_dial_ratio: tope global de sobremarcado (≤0 desactiva).
     """
     if warmup or p_hit is None:
         return {
@@ -183,8 +249,25 @@ def decide_predictive_pace(
         reason = 'drop_over_dmax_soft'
 
     c_dial = compute_c_dial(
-        a_free, a_expected, c_ringing, p_hit, gamma, p_hit_floor=p_hit_floor,
+        a_free, a_expected, c_ringing, p_hit, gamma,
+        p_hit_floor=p_hit_floor, c_waiting=c_waiting,
     )
+    c_dial = apply_dial_ratio_cap(
+        c_dial, a_free, a_expected, c_ringing, max_dial_ratio, c_waiting=c_waiting,
+    )
+    if reason == 'drop_over_dmax_soft':
+        try:
+            global_ratio = float(max_dial_ratio)
+        except (TypeError, ValueError):
+            global_ratio = 0.0
+        if global_ratio <= 0:
+            soft_ratio = SOFT_HOLD_MAX_RATIO
+        else:
+            soft_ratio = min(global_ratio, SOFT_HOLD_MAX_RATIO)
+        c_dial = apply_dial_ratio_cap(
+            c_dial, a_free, a_expected, c_ringing, soft_ratio, c_waiting=c_waiting,
+        )
+
     return {
         'mode': MODE_PREDICTIVE,
         'gamma': gamma,
