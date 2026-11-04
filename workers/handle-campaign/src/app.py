@@ -1,6 +1,7 @@
-from settings.default import GEARMAN_JOB_SERVERS, GEARMAN_JOBS
+from settings.default import GEARMAN_JOB_SERVERS, GEARMAN_JOBS, REQUIRE_ENDPOINTS
 
 from handler.naive import AverageWorker, SchedulerWorker
+from handler.origin_guardrails import check_endpoints_or_raise
 
 import gearman
 import logging
@@ -10,6 +11,14 @@ logger = logging.getLogger(__name__)
 WORKER = AverageWorker
 
 SCHEDULER_WORKER = SchedulerWorker
+
+
+def _redis_for_boot_check():
+    AverageWorker.connect_redis_dialer()
+    return AverageWorker.REDIS_DIALER_CONNECTION
+
+
+check_endpoints_or_raise(_redis_for_boot_check, require=REQUIRE_ENDPOINTS)
 
 gm_worker = gearman.GearmanWorker(GEARMAN_JOB_SERVERS)
 

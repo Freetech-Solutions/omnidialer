@@ -46,6 +46,8 @@ from settings.default import (
     AUDIT_UP_STREAK_TICKS,
     AUDIT_DOWN_STREAK_TICKS,
     AUDIT_IDLE_DOWN_STREAK_TICKS,
+    ACD_STALE_EVICT_TICKS,
+    AUDIT_INCOMPLETE_DOWN_STREAK_TICKS,
     MAX_ABANDON_RATE,
     WARM_UP_SAMPLE_SIZE,
     PREDICTIVE_TICK_MS,
@@ -57,11 +59,22 @@ from settings.default import (
     P_LIB_REMAINING_EPS,
     PREDICTIVE_ENABLED,
     GAMMA_THROTTLE_FLOOR,
+    MAX_DIAL_RATIO,
     PACING_SNAPSHOT_TTL_SEC,
     THROTTLE_STREAK_K,
+    THROTTLE_STREAK_SEC,
+    THROTTLE_MIN_HITS,
     THROTTLE_EXIT_RATIO,
+    THROTTLE_STATE_TTL_SEC,
+    CAPS_REVALIDATE_EVERY,
+    REQUIRE_ENDPOINTS,
 )
 from handler.event_stream import notify_dialer_event
+from handler.origin_guardrails import (
+    check_endpoints_or_raise,
+    evaluate_backpressure_guardrails,
+    try_consume_global_caps,
+)
 from handler.predictive_pacer import (
     apply_channel_caps,
     decide_predictive_pace,
@@ -354,10 +367,15 @@ FAIL_NO_RULES_EVENTS = [
 P_HIT_ALPHA = 0.1  # EWMA alpha para P_HIT
 AMD_TIME = 0.0  # legado; media medida vive en METRICS.AMD_TIME / AMD_LATENCY
 HIT_STATUS = 'ANSWERED_PSTN'
+# Trunk / originate failures: count TECH_FAIL only — do not move P_HIT EWMA.
+TECHNICAL_FAIL_STATUSES = frozenset({
+    'ORIGINATE_FAILED', 'CHANUNAVAIL', 'CONGESTION',
+    'INVALID_NUMBER', '404_NOT_FOUND', '480_TEMPORARILY_UNAVAILABLE',
+})
+# Contact-level fails that update P_HIT EWMA toward 0.
 FAIL_HIT_STATUSES = frozenset({
-    'BUSY', 'NOANSWER', 'CONGESTION', 'TIMEOUT', 'TERMINATED', 'CHANUNAVAIL',
-    'INVALID_NUMBER', 'CANCEL', 'AMD', 'EXIT_SHORTCALL', 'ORIGINATE_FAILED',
-    '480_TEMPORARILY_UNAVAILABLE', '404_NOT_FOUND',
+    'BUSY', 'NOANSWER', 'TIMEOUT', 'TERMINATED', 'CANCEL', 'AMD',
+    'EXIT_SHORTCALL',
 })
 ABANDON_STATUSES = frozenset({'EXIT_ABANDON', 'EXIT_TIMEOUT'})
 
@@ -365,8 +383,62 @@ ABANDON_STATUSES = frozenset({'EXIT_ABANDON', 'EXIT_TIMEOUT'})
 # Defaults: MAX_ABANDON_RATE=0.03, WARM_UP_SAMPLE_SIZE=50, PREDICTIVE_TICK_MS=1000,
 # HIT_RATE_FLOOR=0.05, DROP_RATE_ALPHA=0.1 (fuente de γ; ventana ≈ 2/α−1 connects),
 # DEFAULT_ART_SEC=15, P_LIB_REMAINING_EPS=1.0, PREDICTIVE_ENABLED=True,
-# GAMMA_THROTTLE_FLOOR=0.2, PACING_SNAPSHOT_TTL_SEC=30, THROTTLE_STREAK_K=5,
-# THROTTLE_EXIT_RATIO=0.8.
+# GAMMA_THROTTLE_FLOOR=0.2, MAX_DIAL_RATIO=5, PACING_SNAPSHOT_TTL_SEC=30,
+# THROTTLE_STREAK_SEC=5 (fallback K), THROTTLE_MIN_HITS=20,
+# THROTTLE_EXIT_RATIO=0.8, THROTTLE_STATE_TTL_SEC=300, CAPS_REVALIDATE_EVERY=3.
+
+# Throttle kill-switch atómico (wall-clock over_since + latch).
+# KEYS: over_since, latch
+# ARGV: drop_rate, d_max, exit_thr, streak_sec, ttl, now_ts
+# return {over_sec, latched(0|1), force(0|1), event}
+_THROTTLE_UPDATE_LUA = """
+local over_key = KEYS[1]
+local latch_key = KEYS[2]
+local d = tonumber(ARGV[1]) or 0
+local d_max = tonumber(ARGV[2]) or 0
+local exit_thr = tonumber(ARGV[3]) or 0
+local streak_sec = tonumber(ARGV[4]) or 5
+local ttl = tonumber(ARGV[5]) or 300
+local now_ts = tonumber(ARGV[6]) or 0
+if streak_sec < 1 then streak_sec = 1 end
+local latched = redis.call('EXISTS', latch_key) == 1
+local over_since = tonumber(redis.call('GET', over_key))
+local function over_sec()
+  if over_since == nil then return 0 end
+  local elapsed = now_ts - over_since
+  if elapsed < 0 then return 0 end
+  return math.floor(elapsed)
+end
+if latched then
+  if d < exit_thr then
+    redis.call('DEL', latch_key)
+    redis.call('DEL', over_key)
+    return {0, 0, 0, 'THROTTLE_CLEARED'}
+  end
+  redis.call('EXPIRE', latch_key, ttl)
+  if over_since ~= nil then
+    redis.call('EXPIRE', over_key, ttl)
+  end
+  return {over_sec(), 1, 1, ''}
+end
+if d_max > 0 and d >= d_max then
+  if over_since == nil then
+    over_since = now_ts
+    redis.call('SET', over_key, tostring(now_ts), 'EX', ttl)
+  else
+    redis.call('EXPIRE', over_key, ttl)
+  end
+  local elapsed = now_ts - over_since
+  if elapsed < 0 then elapsed = 0 end
+  if elapsed >= streak_sec then
+    redis.call('SET', latch_key, '1', 'EX', ttl)
+    return {math.floor(elapsed), 1, 1, 'THROTTLE_ENGAGED'}
+  end
+  return {math.floor(elapsed), 0, 0, ''}
+end
+redis.call('DEL', over_key)
+return {0, 0, 0, ''}
+"""
 
 # Busy statuses that can contribute to A_expected / P_lib (H4).
 BUSY_LIBERATION_STATUSES = frozenset({'ONCALL', 'POSTCALL', 'PAUSE-ACW'})
@@ -379,6 +451,11 @@ JOB_STARTED = 1
 JOB_FAILED = 2
 
 CALLS_DECR_DEDUP_TTL_SEC = int(os.getenv('DIALER_CALLS_DECR_DEDUP_TTL_SEC', '3600'))
+# Marker contacto tras cualquier DECR exitoso (TTL corto): cruza Dial AMD/fail
+# con callid ↔ ChannelDestroyed sin/otro callid. Reserve limpia al reintentar.
+CALLS_CONTACT_DECR_MARKER_TTL_SEC = int(
+    os.getenv('DIALER_CALLS_CONTACT_DECR_MARKER_TTL_SEC', '120'),
+)
 PROCESS_CAMPAIGN_LOCK_TTL_SEC = int(os.getenv('DIALER_PROCESS_CAMPAIGN_LOCK_TTL_SEC', '60'))
 AUDIT_ACTIVE_CHANNELS_JOB = 'audit-active-channels'
 AUDIT_LOCK_KEY = 'OML:CALLS:AUDIT:LOCK'
@@ -453,26 +530,29 @@ return {tostring(sum), tostring(count), tostring(avg)}
 """
 
 # Actualiza METRICS: P_HIT (EWMA), P_HIT_RATIO, DROP_RATE, DROP_RATE_EWMA + counts.
-# ARGV: hit_flag (1|0), abandon_flag (1|0), p_hit_alpha, drop_alpha
+# ARGV: hit_flag (1|0), abandon_flag (1|0), p_hit_alpha, drop_alpha, tech_fail (1|0)
 # Semántica:
-#   hit=1, abandon=0 → HIT/CONNECT++; P_HIT EWMA←1; DROP_RATE_EWMA←0 (decae)
-#   hit=0, abandon=0 → FAIL++; P_HIT EWMA←0; no toca DROP_RATE_EWMA
-#   hit=0, abandon=1 → ABANDON++; no toca P_HIT/FAIL; DROP_RATE_EWMA←1
-# DROP_RATE = ABANDON_COUNT / HIT_COUNT (0 si HIT=0) — reporting acumulado
-# DROP_RATE_EWMA = EWMA simétrico (α=DROP_RATE_ALPHA) — fuente canónica para γ
-# AMD_TIME no se toca aquí (lo actualiza AmdLatency / H7).
+#   hit=1 → HIT/CONNECT++; P_HIT EWMA←1; DROP_RATE_EWMA←0 (decae)
+#   tech_fail=1 → TECH_FAIL_COUNT++; no toca P_HIT / FAIL / DROP_EWMA
+#   hit=0, abandon=0, tech=0 → FAIL++; P_HIT EWMA←0; no toca DROP_RATE_EWMA
+#   abandon=1 → ABANDON++; no toca P_HIT/FAIL; DROP_RATE_EWMA←1
+# DROP_RATE = ABANDON / HIT — reporting acumulado
+# DROP_RATE_EWMA — fuente canónica para γ
 _UPDATE_CAMPAIGN_HIT_LUA = """
 local key = KEYS[1]
 local hit_flag = tonumber(ARGV[1]) or 0
 local abandon_flag = tonumber(ARGV[2]) or 0
 local alpha = tonumber(ARGV[3]) or 0.1
 local drop_alpha = tonumber(ARGV[4]) or 0.1
+local tech_fail = tonumber(ARGV[5]) or 0
 
 if abandon_flag == 1 then
   redis.call('HINCRBY', key, 'ABANDON_COUNT', 1)
   local prev_d = tonumber(redis.call('HGET', key, 'DROP_RATE_EWMA')) or 0
   local drop_ewma = prev_d + drop_alpha * (1 - prev_d)
   redis.call('HSET', key, 'DROP_RATE_EWMA', tostring(drop_ewma))
+elseif tech_fail == 1 then
+  redis.call('HINCRBY', key, 'TECH_FAIL_COUNT', 1)
 elseif hit_flag == 1 then
   redis.call('HINCRBY', key, 'HIT_COUNT', 1)
   redis.call('HINCRBY', key, 'CONNECT_COUNT', 1)
@@ -492,6 +572,7 @@ end
 local hits = tonumber(redis.call('HGET', key, 'HIT_COUNT')) or 0
 local fails = tonumber(redis.call('HGET', key, 'FAIL_COUNT')) or 0
 local abandons = tonumber(redis.call('HGET', key, 'ABANDON_COUNT')) or 0
+local tech = tonumber(redis.call('HGET', key, 'TECH_FAIL_COUNT')) or 0
 local p_hit_ratio = 0
 if (hits + fails) > 0 then
   p_hit_ratio = hits / (hits + fails)
@@ -510,7 +591,8 @@ return {
   tostring(drop_rate),
   tostring(hits),
   tostring(fails),
-  tostring(abandons)
+  tostring(abandons),
+  tostring(tech)
 }
 """
 
@@ -519,7 +601,11 @@ CALLS_DECR_DIAL_STATUSES = (
     'CANCEL', 'AMD', 'EXIT_SHORTCALL', 'ORIGINATE_FAILED',
     'INVALID_NUMBER', 'CHANUNAVAIL', '480_TEMPORARILY_UNAVAILABLE',
     'NOANSWER', '404_NOT_FOUND', 'EXIT_ABANDON', 'EXIT_TIMEOUT',
+    # Early-fail Dial BUSY/CONGESTION/TIMEOUT: ACD may omit ChannelDestroyed.
+    'BUSY', 'CONGESTION', 'TIMEOUT',
 )
+
+
 
 # Fases de canal dialer (CAMP:{id}:CHANNELS + OML:CALLS:PHASE:...)
 PHASE_RINGING = 'RINGING'
@@ -547,19 +633,31 @@ CALLS_PHASE_TTL_SEC = int(os.getenv('DIALER_CALLS_PHASE_TTL_SEC', str(4 * 3600))
 # Reserva atómica: INCR total + check max + HINCR RINGING + SET phase + reserve_ts
 # KEYS: calls, channels, phase_contact, reserve_ts
 # ARGV: max_channels, phase, reserve_ts, reserve_ttl, phase_ttl
-# return {ok(0|1), current_total}
+# return {ok(0|1), current_total, reason}
+# reason: ok | phase_exists | max_channels
+# Idempotente: si ya hay phase del contacto, no INCR (evita doble reserva).
 _RESERVE_CHANNEL_LUA = """
+local existing = redis.call('GET', KEYS[3])
+if existing and existing ~= false and existing ~= '' then
+  local cur = tonumber(redis.call('GET', KEYS[1])) or 0
+  return {0, cur, 'phase_exists'}
+end
 local current = tonumber(redis.call('INCR', KEYS[1]))
 local maxch = tonumber(ARGV[1]) or 0
 if current > maxch then
   redis.call('DECR', KEYS[1])
-  return {0, current - 1}
+  return {0, current - 1, 'max_channels'}
 end
 redis.call('HINCRBY', KEYS[2], ARGV[2], 1)
 redis.call('SET', KEYS[3], ARGV[2], 'EX', tonumber(ARGV[5]) or 14400)
 redis.call('SET', KEYS[4], ARGV[3], 'EX', tonumber(ARGV[4]) or 120)
-return {1, current}
+return {1, current, 'ok'}
 """
+
+RESERVE_OK = 'ok'
+RESERVE_PHASE_EXISTS = 'phase_exists'
+RESERVE_MAX_CHANNELS = 'max_channels'
+RESERVE_ERROR = 'error'
 
 # Transición forward-only de fase (adopción si no hay phase key).
 # KEYS: channels, phase_contact, phase_callid (puede coincidir con contact)
@@ -581,16 +679,17 @@ if (not current or current == false) and KEYS[2] ~= KEYS[3] then
   current = redis.call('GET', KEYS[2])
 end
 if not current or current == false then
-  redis.call('HINCRBY', KEYS[1], target, 1)
-  redis.call('SET', KEYS[3], target, 'EX', ttl)
-  if KEYS[2] ~= KEYS[3] then
-    redis.call('DEL', KEYS[2])
-  end
-  return {1, 'adopt', target}
+  -- Sin reserva/phase viva: no adoptar (evita ONCALL/WAITING fantasma).
+  return {0, 'no_reserve', ''}
 end
 local cur_rank = ranks[current] or 0
 if cur_rank >= target_rank then
-  redis.call('SET', KEYS[3], current, 'EX', ttl)
+  -- Solo EXPIRE: un SET aquí puede resucitar la phase key si finalize
+  -- ya hizo DEL entre nuestro GET y este write (race → ONCALL huérfano
+  -- con DECR dedup ya seteado y hash en 0).
+  if redis.call('EXISTS', KEYS[3]) == 1 then
+    redis.call('EXPIRE', KEYS[3], ttl)
+  end
   if KEYS[2] ~= KEYS[3] then
     redis.call('DEL', KEYS[2])
   end
@@ -637,6 +736,33 @@ if phase and phase ~= false and phase ~= '' then
 else
   orphan = 1
   phase = ''
+end
+if val == 0 then
+  redis.call('HSET', KEYS[2], 'RINGING', 0, 'WAITING_AGENT', 0, 'ONCALL', 0)
+elseif orphan == 1 then
+  local r = math.max(0, tonumber(redis.call('HGET', KEYS[2], 'RINGING')) or 0)
+  local w = math.max(0, tonumber(redis.call('HGET', KEYS[2], 'WAITING_AGENT')) or 0)
+  local o = math.max(0, tonumber(redis.call('HGET', KEYS[2], 'ONCALL')) or 0)
+  local excess = (r + w + o) - val
+  if excess > 0 then
+    local dec_r = math.min(r, excess)
+    if dec_r > 0 then
+      r = r - dec_r
+      excess = excess - dec_r
+      redis.call('HSET', KEYS[2], 'RINGING', r)
+    end
+    local dec_w = math.min(w, excess)
+    if dec_w > 0 then
+      w = w - dec_w
+      excess = excess - dec_w
+      redis.call('HSET', KEYS[2], 'WAITING_AGENT', w)
+    end
+    local dec_o = math.min(o, excess)
+    if dec_o > 0 then
+      o = o - dec_o
+      redis.call('HSET', KEYS[2], 'ONCALL', o)
+    end
+  end
 end
 redis.call('DEL', KEYS[3])
 if KEYS[4] ~= KEYS[3] then
@@ -896,6 +1022,9 @@ class AverageWorker(DialerWorker):
         my_key = f'CAMP:{id_campaign}:DISTRIBUTION'
         cls.REDIS_DIALER_CONNECTION.hset(my_key, 'CALLS', int(contacts_attempts_number_prev))
 
+        if contacts_attempts_number_prev <= 0:
+            return 0
+
         active_ids_raw = cls.REDIS_DIALER_CONNECTION.smembers(cls.ACTIVE_CAMPAIGNS_SET)
         if not active_ids_raw:
             return 0
@@ -915,17 +1044,40 @@ class AverageWorker(DialerWorker):
         for key in keys:
             pipe.hget(key, 'STATUS')
             pipe.hget(key, 'CALLS')
+            pipe.hget(key, 'PRIORITY')
         flat = pipe.execute()
 
         total_calls = 0
-        for i in range(0, len(flat), 2):
+        demanding_priorities = []
+        total_active_priority = 0
+        demanding_priority = 0
+        for i in range(0, len(flat), 3):
             status = flat[i]
             calls_raw = flat[i + 1]
+            prio_raw = flat[i + 2]
             if status == '1':
                 try:
-                    total_calls += int(calls_raw or 0)
+                    calls_val = int(calls_raw or 0)
                 except (TypeError, ValueError):
-                    pass
+                    calls_val = 0
+                try:
+                    prio_val = max(0, int(prio_raw or 0))
+                except (TypeError, ValueError):
+                    prio_val = 0
+                total_active_priority += prio_val
+                if calls_val > 0:
+                    total_calls += calls_val
+                    demanding_priorities.append(prio_val)
+                    demanding_priority += prio_val
+
+        if total_calls <= 0:
+            return 0
+
+        # Si solo esta campaña demanda llamadas en este ciclo, o todas las campañas
+        # demandantes tienen la misma prioridad (el reparto multi-cola ya pondera
+        # agentes por 1/queue_count), no aplicar un segundo recorte por porcentaje.
+        if len(demanding_priorities) <= 1 or len(set(demanding_priorities)) == 1:
+            return contacts_attempts_number_prev
 
         pct_raw = cls.REDIS_DIALER_CONNECTION.hget(my_key, 'PERCENTAGE')
         try:
@@ -933,8 +1085,11 @@ class AverageWorker(DialerWorker):
         except (TypeError, ValueError):
             percentage = 0.0
 
-        if total_calls <= 0:
-            return 0
+        if total_active_priority > 0 and 0 < demanding_priority < total_active_priority:
+            percentage = min(
+                1.0,
+                percentage * (float(total_active_priority) / float(demanding_priority)),
+            )
 
         assigned = int(floor(percentage * total_calls))
 
@@ -1064,11 +1219,71 @@ class AverageWorker(DialerWorker):
             cls.REDIS_DIALER_CONNECTION.delete(lock_key)
 
     @classmethod
-    def process_campaign_inside(cls, id_campaign):
+    def _process_campaign_lock_key(cls, id_campaign):
+        return f'PROCESS-CAMPAIGN-{id_campaign}'
+
+    @classmethod
+    def _renew_process_campaign_lock(cls, id_campaign, token):
+        """Renueva TTL sólo si el token sigue siendo el dueño del lease."""
+        if int(id_campaign or 0) == 0 or not token:
+            return False
+        try:
+            cls.connect_redis_dialer()
+            return bool(cls.REDIS_DIALER_CONNECTION.eval(
+                _LEASE_RENEW_LUA, 1,
+                cls._process_campaign_lock_key(id_campaign),
+                token,
+                PROCESS_CAMPAIGN_LOCK_TTL_SEC,
+            ))
+        except Exception:
+            logger.debug(
+                'Campaign %s: renew process-campaign lock failed', id_campaign,
+                exc_info=True,
+            )
+            return False
+
+    @classmethod
+    def _release_process_campaign_lock(cls, id_campaign, token):
+        """Libera el lease sólo si el token sigue siendo el nuestro."""
+        if int(id_campaign or 0) == 0 or not token:
+            return False
+        try:
+            cls.connect_redis_dialer()
+            return bool(cls.REDIS_DIALER_CONNECTION.eval(
+                _LEASE_RELEASE_LUA, 1,
+                cls._process_campaign_lock_key(id_campaign),
+                token,
+            ))
+        except Exception:
+            logger.debug(
+                'Campaign %s: release process-campaign lock failed', id_campaign,
+                exc_info=True,
+            )
+            return False
+
+    @classmethod
+    def _revert_unprocessed_contacts(cls, id_campaign, remaining_contacts):
+        """Devuelve contactos SELECTED_CALL no discados a CREATED al salir del lote."""
+        for pending_contact in (remaining_contacts or []):
+            try:
+                cls._mark_contact_status_created(id_campaign, pending_contact[0])
+            except Exception:
+                logger.warning(
+                    'Campaign %s: failed reverting contact %s to CREATED',
+                    id_campaign, pending_contact[0], exc_info=True,
+                )
+
+    @classmethod
+    def process_campaign_inside(cls, id_campaign, lock_token=None):
         while cls.campaign_is_active(id_campaign):
             cls.connect_redis_dialer()
-            cls.REDIS_DIALER_CONNECTION.expire(
-                f'PROCESS-CAMPAIGN-{id_campaign}', PROCESS_CAMPAIGN_LOCK_TTL_SEC)
+            if lock_token and not cls._renew_process_campaign_lock(
+                    id_campaign, lock_token):
+                logger.warning(
+                    'Campaign %s: lost PROCESS-CAMPAIGN lease; exiting loop',
+                    id_campaign,
+                )
+                break
             logger.debug(f'\nCampaign {id_campaign} is active')
             allowed_to_call, extra_info = cls.is_allowed_to_call(id_campaign)
             if allowed_to_call:
@@ -1080,7 +1295,7 @@ class AverageWorker(DialerWorker):
                 # Conectar Redis antes del loop para reservas atómicas
                 cls.connect_redis_dialer()
                 campaign_max = cls.get_campaign_max_available_channels(id_campaign)
-                active_channels = cls.get_active_channels(id_campaign)
+                active_channels, _phases_snap = cls._get_calls_and_phases(id_campaign)
 
                 # Log de información de canales en el ciclo
                 logger.debug(
@@ -1091,54 +1306,192 @@ class AverageWorker(DialerWorker):
 
                 initial_time = datetime.datetime.now()
                 caps_calls_counter = 0
-                contacts = cls.take_contacts(contacts_attempts_number, id_campaign)
-                if (
-                    not contacts
-                    and contacts_attempts_number > 0
-                    and active_channels == 0
-                ):
+                dials_in_batch = 0
+                contacts = (
+                    cls.take_contacts(contacts_attempts_number, id_campaign)
+                    if contacts_attempts_number > 0
+                    else []
+                )
+                if lock_token and not cls._renew_process_campaign_lock(
+                        id_campaign, lock_token):
+                    logger.warning(
+                        'Campaign %s: lost PROCESS-CAMPAIGN lease after '
+                        'take_contacts; reverting %s contacts and exiting',
+                        id_campaign, len(contacts),
+                    )
+                    cls._revert_unprocessed_contacts(id_campaign, contacts)
+                    break
+                # Recycle aunque OML:CALLS>0: en vuelo = phase keys.
+                # CALLS zombi no debe dejar SELECTED sin CREATED eternos.
+                if not contacts:
                     recycled = cls._recycle_stuck_selected_if_idle(id_campaign)
-                    if recycled:
+                    if recycled and contacts_attempts_number > 0:
                         contacts = cls.take_contacts(
                             contacts_attempts_number, id_campaign)
+                    if lock_token and not cls._renew_process_campaign_lock(
+                            id_campaign, lock_token):
+                        logger.warning(
+                            'Campaign %s: lost PROCESS-CAMPAIGN lease after '
+                            'recycle; reverting %s contacts and exiting',
+                            id_campaign, len(contacts),
+                        )
+                        cls._revert_unprocessed_contacts(id_campaign, contacts)
+                        break
 
                 if not contacts:
                     dial_mode, _ = cls.resolve_dial_mode(id_campaign)
+                    if lock_token and not cls._renew_process_campaign_lock(
+                            id_campaign, lock_token):
+                        logger.warning(
+                            'Campaign %s: lost PROCESS-CAMPAIGN lease (idle); '
+                            'exiting',
+                            id_campaign,
+                        )
+                        break
                     if (
                         dial_mode == cls.DIAL_MODE_PREDICTIVE
                         and PREDICTIVE_TICK_MS > 0
                     ):
                         sleep(PREDICTIVE_TICK_MS / 1000.0)
                     elif TIME_BETWEEN_CALLS:
-                        sleep(float(TIME_BETWEEN_CALLS))
-                for contact in contacts:
-                    while True:
-                        # we need to ensure the selected contact is eventually called
-                        current_time = datetime.datetime.now()
-                        current_delta = current_time - initial_time
-                        if current_delta >= timedelta(seconds=1):
-                            logger.debug(f"Campaign {id_campaign}: CAPS init")
-                            caps_calls_counter = 0
-                            initial_time = current_time
-                        else:
-                            if caps_calls_counter < CAPS:
-                                logger.debug(
-                                    f"Campaign {id_campaign}: attempt to call selected contact")
-
-                                # Reserva ANTES de mandar a Gearman para evitar el lag
-                                if not cls._reserve_dialer_channel(id_campaign, contact[0]):
+                        sleep(max(float(TIME_BETWEEN_CALLS), 0.1))
+                lost_lease = False
+                abort_batch = False
+                revalidate_every = max(1, int(CAPS_REVALIDATE_EVERY or CAPS or 1))
+                idx = 0
+                contact_handled = True
+                try:
+                    for idx, contact in enumerate(contacts):
+                        contact_handled = False
+                        if abort_batch:
+                            cls._mark_contact_status_created(id_campaign, contact[0])
+                            contact_handled = True
+                            continue
+                        while True:
+                            # we need to ensure the selected contact is eventually called
+                            current_time = datetime.datetime.now()
+                            current_delta = current_time - initial_time
+                            if current_delta >= timedelta(seconds=1):
+                                logger.debug(f"Campaign {id_campaign}: CAPS init")
+                                caps_calls_counter = 0
+                                initial_time = current_time
+                                # Cada ventana CAPS: renovar latch + chequear headroom
+                                should_abort, abort_reason = cls._caps_batch_should_abort(
+                                    id_campaign, campaign_max, dials_done=dials_in_batch,
+                                )
+                                if should_abort:
+                                    logger.info(
+                                        'Campaign %s: abort CAPS batch (%s) '
+                                        'after %s dials',
+                                        id_campaign, abort_reason, dials_in_batch,
+                                    )
                                     cls._mark_contact_status_created(
                                         id_campaign, contact[0],
                                     )
+                                    contact_handled = True
+                                    abort_batch = True
                                     break
-
-                                cls.attempt_contact(contact, id_campaign)
-                                caps_calls_counter += 1
-                                break
                             else:
-                                logger.debug(f"Campaign {id_campaign}: CAPS sleep")
-                                remaining = (timedelta(seconds=1) - current_delta).total_seconds()
-                                sleep(remaining)
+                                if caps_calls_counter < CAPS:
+                                    logger.debug(
+                                        f"Campaign {id_campaign}: attempt to call selected contact")
+
+                                    if (
+                                        dials_in_batch > 0
+                                        and dials_in_batch % revalidate_every == 0
+                                    ):
+                                        should_abort, abort_reason = (
+                                            cls._caps_batch_should_abort(
+                                                id_campaign, campaign_max,
+                                                dials_done=dials_in_batch,
+                                            )
+                                        )
+                                        if should_abort:
+                                            logger.info(
+                                                'Campaign %s: abort CAPS batch (%s) '
+                                                'after %s dials',
+                                                id_campaign, abort_reason,
+                                                dials_in_batch,
+                                            )
+                                            cls._mark_contact_status_created(
+                                                id_campaign, contact[0],
+                                            )
+                                            contact_handled = True
+                                            abort_batch = True
+                                            break
+
+                                    # P0: techo global originates/s (antes de reservar)
+                                    cls.connect_redis_dialer()
+                                    caps_ok, caps_reason = try_consume_global_caps(
+                                        cls.REDIS_DIALER_CONNECTION,
+                                    )
+                                    if not caps_ok:
+                                        logger.info(
+                                            'Campaign %s: abort CAPS batch (%s) '
+                                            'after %s dials',
+                                            id_campaign,
+                                            caps_reason or 'global_caps',
+                                            dials_in_batch,
+                                        )
+                                        cls._mark_contact_status_created(
+                                            id_campaign, contact[0],
+                                        )
+                                        contact_handled = True
+                                        abort_batch = True
+                                        break
+
+                                    # Reserva ANTES de mandar a Gearman para evitar el lag
+                                    reserve_reason = cls._reserve_dialer_channel(
+                                        id_campaign, contact[0],
+                                    )
+                                    if reserve_reason != RESERVE_OK:
+                                        # phase viva: no reencolar a CREATED
+                                        if reserve_reason != RESERVE_PHASE_EXISTS:
+                                            cls._mark_contact_status_created(
+                                                id_campaign, contact[0],
+                                            )
+                                        contact_handled = True
+                                        if reserve_reason == RESERVE_MAX_CHANNELS:
+                                            abort_batch = True
+                                        break
+
+                                    cls.attempt_contact(contact, id_campaign)
+                                    contact_handled = True
+                                    caps_calls_counter += 1
+                                    dials_in_batch += 1
+                                    if lock_token and not cls._renew_process_campaign_lock(
+                                            id_campaign, lock_token):
+                                        logger.warning(
+                                            'Campaign %s: lost PROCESS-CAMPAIGN '
+                                            'lease mid-dial; exiting',
+                                            id_campaign,
+                                        )
+                                        lost_lease = True
+                                    break
+                                else:
+                                    logger.debug(f"Campaign {id_campaign}: CAPS sleep")
+                                    remaining = (timedelta(seconds=1) - current_delta).total_seconds()
+                                    if lock_token and not cls._renew_process_campaign_lock(
+                                            id_campaign, lock_token):
+                                        logger.warning(
+                                            'Campaign %s: lost PROCESS-CAMPAIGN '
+                                            'lease during CAPS; exiting',
+                                            id_campaign,
+                                        )
+                                        lost_lease = True
+                                        break
+                                    sleep(remaining)
+                        if lost_lease:
+                            break
+                finally:
+                    if contacts:
+                        unhandled_start = idx + 1 if contact_handled else idx
+                        if unhandled_start < len(contacts):
+                            cls._revert_unprocessed_contacts(
+                                id_campaign, contacts[unhandled_start:],
+                            )
+                if lost_lease:
+                    break
             else:
                 # schedule process-campaign for the next time the campaign is allowed to run
                 next_allowed_date = cls.get_next_allowed_date(id_campaign, extra_info)
@@ -1401,14 +1754,14 @@ class AverageWorker(DialerWorker):
                         VALUES (%s, %s, %s, %s, %s, %s);""", incidence_rule)
                 if orig_status_campaign == ACTIVE:
                     cls.set_campaign_status(id_campaign, ACTIVE, cursor_dialer)
-                    message = json.dumps({'id_campaign': id_campaign})
-                    cls.GM_CLIENT.submit_job('process-campaign', message, background=True)
         try:
             cls.get_boost_factor.cache_clear()
             cls.get_predictive_model.cache_clear()
             cls.get_campaign_max_available_channels.cache_clear()
             cls.get_incidence_rule.cache_clear()
             cls.get_incidence_rule_disposition.cache_clear()
+            cls.get_opening_hours.cache_clear()
+            cls.get_prefix.cache_clear()
         except AttributeError:
             pass
 
@@ -1416,6 +1769,10 @@ class AverageWorker(DialerWorker):
             f'CAMP:{id_campaign}:DISTRIBUTION', 'PRIORITY', priority)
 
         cls.update_percentages_priority_campaigns()
+
+        if orig_status_campaign == ACTIVE:
+            message = json.dumps({'id_campaign': id_campaign})
+            cls.GM_CLIENT.submit_job('process-campaign', message, background=True)
 
         response = f'Campaign {id_campaign} with strategy {contact_strategy} succesfully updated!!!'
 
@@ -1608,36 +1965,34 @@ class AverageWorker(DialerWorker):
     @classmethod
     def _recycle_stuck_selected_if_idle(cls, id_campaign):
         """
-        Recupera contactos SELECTED_CALL cuando no hay canales en vuelo.
+        Recupera contactos SELECTED_CALL sin phase key viva.
 
         take_contacts solo consume STATUS_CREATED. Si un ciclo marcó SELECTED
         y el originate/evento no revirtió el status, el loop queda vivo con
-        cupo > 0 y 0 contactos tomables. clean_selected_contacts solo corría
-        en start/resume.
+        cupo > 0 y 0 contactos tomables.
 
-        En vuelo real = phase keys OML:CALLS:PHASE:{camp}:*. El hash
-        CAMP:CHANNELS puede quedar en ONCALL>0 sin keys (ghost) y no debe
-        bloquear el recycle ni usarse para re-discar contactos con key viva.
+        En vuelo real = phase keys OML:CALLS:PHASE:{camp}:*. Ni OML:CALLS
+        ni el hash CAMP:CHANNELS bloquean el recycle (pueden quedar zombis
+        o desfasados); solo se excluyen contactos con phase key.
         """
         active = cls.get_active_channels(id_campaign)
-        if active != 0:
-            return 0
-        recent_reserve = cls._campaign_has_recent_reserve(id_campaign)
-        if recent_reserve:
-            return 0
         phases = cls.get_campaign_channel_phases(id_campaign)
         phase_total = phases.get('TOTAL', 0) or 0
         in_flight = cls._in_flight_contact_ids(id_campaign)
         if in_flight:
             recycled = cls.clean_selected_contacts(
                 id_campaign, exclude_contact_ids=in_flight) or 0
-            logger.warning(
-                'Campaign %s: recycle SELECTED except %s in-flight phase keys '
-                '(OML:CALLS=%s hash_oncall=%s recycled=%s)',
-                id_campaign, len(in_flight), active,
-                phases.get(PHASE_ONCALL), recycled,
-            )
+            if recycled:
+                logger.warning(
+                    'Campaign %s: recycle SELECTED except %s in-flight phase '
+                    'keys (OML:CALLS=%s hash_oncall=%s recycled=%s)',
+                    id_campaign, len(in_flight), active,
+                    phases.get(PHASE_ONCALL), recycled,
+                )
             return recycled
+        # Sin phase keys: grace de reserve reciente (ventana pre-phase).
+        if cls._campaign_has_recent_reserve(id_campaign):
+            return 0
         if phase_total > 0:
             logger.warning(
                 'Campaign %s: ghost CHANNELS hash ringing=%s waiting=%s '
@@ -1652,22 +2007,29 @@ class AverageWorker(DialerWorker):
         if recycled:
             logger.warning(
                 'Campaign %s: recycled %s stuck SELECTED_CALL contacts '
-                '(idle, no in-flight phase keys)',
+                '(no in-flight phase keys, OML:CALLS=%s)',
                 id_campaign,
                 recycled,
+                active,
             )
         return recycled
 
     @classmethod
     def check_running_job(cls, id_campaign):
-        first_running_job = cls.REDIS_DIALER_CONNECTION.set(
-            f'PROCESS-CAMPAIGN-{id_campaign}', 'True',
+        """
+        Adquiere lease PROCESS-CAMPAIGN-{id} con token UUID.
+        Retorna el token si se adquirió; None si otro worker ya corre.
+        """
+        token = str(uuid.uuid4())
+        acquired = cls.REDIS_DIALER_CONNECTION.set(
+            cls._process_campaign_lock_key(id_campaign), token,
             nx=True, ex=PROCESS_CAMPAIGN_LOCK_TTL_SEC)
-        if not first_running_job:
+        if not acquired:
             logger.debug(f'Campaign {id_campaign}: is already running')
             cls._notify_dialer_event(json.dumps({'type': 'ALREADY_RUNNING',
                             'camp_id': id_campaign}))
-        return first_running_job
+            return None
+        return token
 
     @classmethod
     @job_handler_decorator
@@ -1681,11 +2043,41 @@ class AverageWorker(DialerWorker):
         id_campaign = data['id_campaign']
         sync_omnileads = data['sync_omnileads']
         cls.clean_selected_contacts(id_campaign)
+        cls._reset_campaign_pacing_state(id_campaign)
         logger.debug(f'Campaign {id_campaign}: starting the campaign')
         cls.set_campaign_status(id_campaign, ACTIVE, sync_omnileads=sync_omnileads)
         message = json.dumps({'id_campaign': id_campaign})
         cls.GM_CLIENT.submit_job('process-campaign', message, background=True)
         return b'Campaign started!'
+
+    @classmethod
+    def _reset_campaign_pacing_state(cls, id_campaign):
+        """
+        Limpia métricas/throttle de pacing al arrancar una campaña.
+
+        Borra METRICS, ATT, THROTTLE_*, PACING. Conserva ART/ACW/AHT/AMD_LATENCY.
+        Errores Redis: log + no bloquea el start.
+        """
+        if int(id_campaign or 0) == 0:
+            return
+        keys = [
+            f'CAMP:{id_campaign}:METRICS',
+            f'CAMP:{id_campaign}:ATT',
+            f'CAMP:{id_campaign}:THROTTLE_STREAK',  # legacy tick key
+            f'CAMP:{id_campaign}:THROTTLE_OVER_SINCE',
+            f'CAMP:{id_campaign}:THROTTLE_LATCH',
+            f'CAMP:{id_campaign}:PACING',
+        ]
+        try:
+            cls.connect_redis_dialer()
+            cls.REDIS_DIALER_CONNECTION.delete(*keys)
+            logger.info(
+                'Campaign %s: reset pacing state keys=%s', id_campaign, keys,
+            )
+        except Exception:
+            logger.exception(
+                'Campaign %s: failed to reset pacing state', id_campaign,
+            )
 
     @classmethod
     def opening_hours_match(cls, cursor, id_campaign):
@@ -1731,20 +2123,47 @@ class AverageWorker(DialerWorker):
 
     @classmethod
     def all_contacts_were_attempted(cls, id_campaign):
-        cls.connect_redis_dialer()
-        pending_initial_contact_attempts = cls.REDIS_DIALER_CONNECTION.hget(
-            f'CAMP:{id_campaign}:COUNTER',
-            'PENDING_INITIAL_CONTACT_ATTEMPTS') or -1
-        return int(pending_initial_contact_attempts) == 0
+        """True si no quedan contactos CREATED/SELECTED ni agendas abortadas (fuente: Postgres)."""
+        with cls.get_dialer_connection() as conn_dialer:
+            cursor = conn_dialer.cursor()
+            cursor.execute(
+                """SELECT COUNT(*) FROM ONLY contact_in_campaign
+                WHERE id_campaign = %s
+                AND (status = %s OR status = %s OR schedule_aborted = true);""",
+                (id_campaign, STATUS_CREATED, STATUS_SELECTED_CALL),
+            )
+            row = cursor.fetchone()
+            return int((row[0] if row else 0) or 0) == 0
 
     @classmethod
     def no_active_incidence_rules(cls, id_campaign):
-        cls.connect_redis_dialer()
-        pending_attempts = cls.REDIS_DIALER_CONNECTION.hget(
-            f'CAMP:{id_campaign}:COUNTER',
-            FINAL_STATUS_TO_NAME[PENDING_ATTEMPTS]
-        )
-        return int(pending_attempts or 0) == 0
+        """True si no hay contactos con final_status PENDING_ATTEMPTS (Postgres)."""
+        with cls.get_dialer_connection() as conn_dialer:
+            cursor = conn_dialer.cursor()
+            cursor.execute(
+                """SELECT COUNT(*) FROM ONLY contact_in_campaign
+                WHERE id_campaign = %s AND final_status = %s;""",
+                (id_campaign, PENDING_ATTEMPTS),
+            )
+            row = cursor.fetchone()
+            return int((row[0] if row else 0) or 0) == 0
+
+    @classmethod
+    def _campaign_has_live_calls(cls, id_campaign):
+        """
+        True si hay llamadas en vuelo: no auto-finalizar ni resetear contadores.
+
+        Phase keys OML:CALLS:PHASE son la señal autoritativa; RESERVE_TS cubre
+        el tránsito originate. No usa OML:CALLS/hash (pueden ser ghost y
+        bloquearían el finalize para siempre).
+        """
+        if int(id_campaign or 0) == 0:
+            return False
+        if cls._in_flight_contact_ids(id_campaign):
+            return True
+        if cls._campaign_has_recent_reserve(id_campaign):
+            return True
+        return False
 
     @classmethod
     def no_active_agendas(cls, id_campaign):
@@ -1825,11 +2244,18 @@ class AverageWorker(DialerWorker):
             if cls.all_contacts_were_attempted(id_campaign) and \
                cls.no_active_incidence_rules(id_campaign) and \
                cls.no_active_agendas(id_campaign):
+                if cls._campaign_has_live_calls(id_campaign):
+                    logger.info(
+                        'Campaign %s: contacts/agendas drained but live '
+                        'calls or recent reserves; defer auto-finalize',
+                        id_campaign,
+                    )
+                    return status == ACTIVE
                 logger.debug(f'Campaign {id_campaign}: no more contacts pending for call')
+                cls.set_campaign_status(id_campaign, FINALIZED, sync_omnileads=True)
                 cls.reset_dialer_calls_counter(
                     id_campaign, reason='auto_finalize_contacts_consumed',
                 )
-                cls.set_campaign_status(id_campaign, FINALIZED, sync_omnileads=True)
                 cls.connect_redis_oml()
                 cls._notify_dialer_event(json.dumps({
                         'type': 'CONTACTS_CONSUMED',
@@ -1939,6 +2365,13 @@ class AverageWorker(DialerWorker):
                 continue
 
             if status == 'READY':
+                # Wrapup / offer-failure cooldown ACD: no contar como libre.
+                try:
+                    if cls.REDIS_OML_CONNECTION.exists(
+                            f'acd:cooldown:agent:{id_agent}'):
+                        continue
+                except Exception:
+                    pass
                 a_free_raw += weight
                 total_ready += 1
                 continue
@@ -1969,14 +2402,16 @@ class AverageWorker(DialerWorker):
                 a_pause_acw += weight
                 total_pause_acw += 1
 
-        if a_free_raw < 1:
-            # Misma semántica legacy: fracción > 0 cuenta como 1 equivalente.
-            a_free = 1 if a_free_raw > 0 else 0
+        if a_free_raw <= 0:
+            a_free = 0
         else:
-            a_free = int(a_free_raw)
+            # Redondear hacia arriba evita perder agentes READY por truncamiento
+            # entero cuando se comparten entre múltiples campañas activas.
+            a_free = int(ceil(a_free_raw))
 
         return {
             'a_free': a_free,
+            'a_free_raw': a_free_raw,
             'total_ready': total_ready,
             'a_oncall': a_oncall,
             'a_postcall': a_postcall,
@@ -2356,6 +2791,103 @@ class AverageWorker(DialerWorker):
             )
 
     @classmethod
+    def _align_phases_after_audit_down(cls, id_campaign, safe_down_target):
+        """
+        Tras bajar OML:CALLS por audit, alinea PHASE keys.
+
+        target==0 → purge total (CALLS forzado a 0 con cluster completo).
+        target>0 → solo puede borrar candidatos RINGING viejos (sin RESERVE_TS
+        reciente). Nunca WAITING_AGENT/ONCALL: una llamada con agente no debe
+        perder la phase key por un scan arbitrario.
+        """
+        if int(id_campaign or 0) == 0:
+            return
+        cls.connect_redis_dialer()
+        r = cls.REDIS_DIALER_CONNECTION
+        target = max(0, int(safe_down_target or 0))
+        if target == 0:
+            cls._clear_campaign_channel_phases(id_campaign)
+            cls._init_campaign_channel_phases(id_campaign)
+            try:
+                for key in r.scan_iter(
+                    match=f'OML:CALLS:RESERVE_TS:{id_campaign}:*', count=200,
+                ):
+                    r.delete(key)
+            except Exception:
+                logger.debug(
+                    'RESERVE_TS cleanup failed camp %s', id_campaign, exc_info=True,
+                )
+            return
+
+        phase_pattern = f'OML:CALLS:PHASE:{id_campaign}:*'
+        prefix = f'OML:CALLS:PHASE:{id_campaign}:'
+        try:
+            keys = list(r.scan_iter(match=phase_pattern, count=200))
+        except Exception:
+            logger.debug(
+                'Phase scan failed camp %s', id_campaign, exc_info=True,
+            )
+            return
+        if len(keys) <= target:
+            return
+
+        now = int(time.time())
+        recent_grace = min(RESERVE_GRACE_SEC, 8)
+        # (age_sec, key) — age alto / sin TS primero; solo RINGING elegibles.
+        purge_candidates = []
+        protected = 0
+        for key in keys:
+            phase_val = cls._decode_redis_str(r.get(key)) or ''
+            if phase_val in (PHASE_WAITING_AGENT, PHASE_ONCALL):
+                protected += 1
+                continue
+            if phase_val != PHASE_RINGING:
+                # Valor desconocido: no tocar (fail-safe).
+                protected += 1
+                continue
+            key_s = cls._decode_redis_str(key) or ''
+            rest = key_s[len(prefix):] if key_s.startswith(prefix) else ''
+            contact_id = rest.split(':', 1)[0] if rest else ''
+            age = None
+            if contact_id:
+                rts = r.get(f'OML:CALLS:RESERVE_TS:{id_campaign}:{contact_id}')
+                if rts is not None:
+                    try:
+                        age = now - int(rts)
+                    except (TypeError, ValueError):
+                        age = None
+            if age is not None and age < recent_grace:
+                protected += 1
+                continue
+            # Sin TS o TS viejo: candidato. age None → más viejo que cualquier TS.
+            purge_candidates.append(
+                (10**12 if age is None else age, key),
+            )
+
+        excess = len(keys) - target
+        if excess <= 0 or not purge_candidates:
+            if excess > 0:
+                logger.info(
+                    'Audit align camp %s: excess=%s but no RINGING purge '
+                    'candidates (protected=%s); skip',
+                    id_campaign, excess, protected,
+                )
+            return
+
+        purge_candidates.sort(key=lambda item: item[0], reverse=True)
+        to_delete = purge_candidates[:excess]
+        deleted = 0
+        for _age, key in to_delete:
+            r.delete(key)
+            deleted += 1
+        if deleted:
+            logger.warning(
+                'Audit aligned phase keys camp %s: purged_ringing=%s '
+                'protected=%s remaining_est=%s target=%s',
+                id_campaign, deleted, protected, len(keys) - deleted, target,
+            )
+
+    @classmethod
     def _init_campaign_channel_phases(cls, id_campaign):
         """Inicializa contadores de fase en 0 (create / reset)."""
         if int(id_campaign or 0) == 0:
@@ -2371,19 +2903,17 @@ class AverageWorker(DialerWorker):
         )
 
     @classmethod
-    def get_campaign_channel_phases(cls, id_campaign):
-        """
-        Lee CAMP:{id}:CHANNELS. Devuelve {RINGING, WAITING_AGENT, ONCALL, TOTAL}.
-        """
-        if int(id_campaign or 0) == 0:
-            return {
-                PHASE_RINGING: 0,
-                PHASE_WAITING_AGENT: 0,
-                PHASE_ONCALL: 0,
-                'TOTAL': 0,
-            }
-        cls.connect_redis_dialer()
-        raw = cls.REDIS_DIALER_CONNECTION.hgetall(cls._channels_hash_key(id_campaign)) or {}
+    def _empty_channel_phases(cls):
+        return {
+            PHASE_RINGING: 0,
+            PHASE_WAITING_AGENT: 0,
+            PHASE_ONCALL: 0,
+            'TOTAL': 0,
+        }
+
+    @classmethod
+    def _phases_from_raw_hash(cls, raw):
+        raw = raw or {}
 
         def _int(name):
             try:
@@ -2402,14 +2932,59 @@ class AverageWorker(DialerWorker):
         }
 
     @classmethod
-    def _reserve_dialer_channel(cls, id_campaign, contact_id) -> bool:
+    def get_campaign_channel_phases(cls, id_campaign):
+        """
+        Lee CAMP:{id}:CHANNELS. Devuelve {RINGING, WAITING_AGENT, ONCALL, TOTAL}.
+        """
+        if int(id_campaign or 0) == 0:
+            return cls._empty_channel_phases()
+        cls.connect_redis_dialer()
+        raw = cls.REDIS_DIALER_CONNECTION.hgetall(cls._channels_hash_key(id_campaign)) or {}
+        return cls._phases_from_raw_hash(raw)
+
+    @classmethod
+    def _get_calls_and_phases(cls, id_campaign):
+        """
+        Snapshot atómico (pipeline) de OML:CALLS + CAMP:{id}:CHANNELS.
+        Evita TOCTOU entre total y desglose de fases en el mismo tick de pacing.
+        """
+        if int(id_campaign or 0) == 0:
+            return 0, cls._empty_channel_phases()
+        cls.connect_redis_dialer()
+        key_calls = f'OML:CALLS:{id_campaign}:DIALER'
+        try:
+            pipe = cls.REDIS_DIALER_CONNECTION.pipeline()
+            pipe.get(key_calls)
+            pipe.hgetall(cls._channels_hash_key(id_campaign))
+            results = pipe.execute()
+            if not results or len(results) < 2:
+                raise RuntimeError('pipeline returned incomplete results')
+            val, raw = results[0], results[1]
+        except Exception:
+            logger.debug(
+                'Campaign %s: pipeline CALLS+CHANNELS failed; fallback',
+                id_campaign, exc_info=True,
+            )
+            return cls.get_active_channels(id_campaign), cls.get_campaign_channel_phases(
+                id_campaign,
+            )
+        try:
+            active = max(0, int(val or 0))
+        except (TypeError, ValueError):
+            active = 0
+        return active, cls._phases_from_raw_hash(raw)
+
+    @classmethod
+    def _reserve_dialer_channel(cls, id_campaign, contact_id) -> str:
         """
         Reserva un cupo en OML:CALLS:{camp}:DIALER (INCR + check max_channels)
         y marca fase RINGING en CAMP:{camp}:CHANNELS.
-        Retorna True si la reserva quedó tomada; False si se revirtió por tope.
+
+        Retorna RESERVE_OK | RESERVE_PHASE_EXISTS | RESERVE_MAX_CHANNELS |
+        RESERVE_ERROR. Con phase existente no se reencola a CREATED.
         """
         if int(id_campaign or 0) == 0:
-            return False
+            return RESERVE_ERROR
         cls.connect_redis_dialer()
         key_calls = f'OML:CALLS:{id_campaign}:DIALER'
         channels_key = cls._channels_hash_key(id_campaign)
@@ -2429,23 +3004,42 @@ class AverageWorker(DialerWorker):
                 'Campaign %s: reserve channel Lua failed contact=%s',
                 id_campaign, contact_id,
             )
-            return False
+            return RESERVE_ERROR
         ok = int(result[0]) == 1 if result else False
         current = int(result[1]) if result and len(result) > 1 else 0
+        reason = result[2] if result and len(result) > 2 else ''
+        if isinstance(reason, bytes):
+            reason = reason.decode('utf-8', errors='replace')
         if not ok:
             cls._publish_calls_count(id_campaign)
+            if reason == RESERVE_PHASE_EXISTS:
+                existing_phase = cls.REDIS_DIALER_CONNECTION.get(phase_key)
+                logger.debug(
+                    'Campaign %s: reserve skipped, contact %s already in phase %s '
+                    '(calls=%s)',
+                    id_campaign, contact_id, existing_phase, current,
+                )
+                return RESERVE_PHASE_EXISTS
             logger.warning(
                 'Campaign %s: Exceeded max channels (%s > %s). Skipping contact %s',
                 id_campaign, current + 1, campaign_max, contact_id,
             )
-            return False
+            return RESERVE_MAX_CHANNELS if reason == RESERVE_MAX_CHANNELS else RESERVE_ERROR
+        # Nuevo intento: limpiar marker de rollback del ciclo anterior.
+        try:
+            cls.REDIS_DIALER_CONNECTION.delete(
+                f'OML:CALLS:DECR:{id_campaign}:{contact_id}',
+            )
+        except Exception:
+            pass
         cls._publish_calls_count(id_campaign)
-        return True
+        return RESERVE_OK
 
     @classmethod
     def _transition_channel_phase(cls, id_campaign, contact_id, callid, target_phase):
         """
-        Avanza la fase de un canal (forward-only). Adopta si no hay phase key.
+        Avanza la fase de un canal (forward-only). Sin phase viva → no-op
+        (no adopta buckets fantasma).
         """
         if int(id_campaign or 0) == 0:
             return False
@@ -2515,8 +3109,10 @@ class AverageWorker(DialerWorker):
 
     @classmethod
     def _calls_decr_dedup_key(cls, id_campaign, contact_id, callid):
-        safe_callid = callid or f"{id_campaign}:{contact_id}"
-        return f'OML:CALLS:DECR:{id_campaign}:{contact_id}:{safe_callid}'
+        """Dedup por callid si existe; si no, clave estable por contacto (rollbacks)."""
+        if callid:
+            return f'OML:CALLS:DECR:{id_campaign}:{contact_id}:{callid}'
+        return f'OML:CALLS:DECR:{id_campaign}:{contact_id}'
 
     @classmethod
     def _refresh_campaign_aht(cls, id_campaign):
@@ -2697,29 +3293,31 @@ class AverageWorker(DialerWorker):
         cls._refresh_campaign_aht(id_campaign)
 
     @classmethod
-    def update_campaign_hit(cls, id_campaign, hit, abandon=False):
+    def update_campaign_hit(cls, id_campaign, hit, abandon=False, tech=False):
         """
         Actualiza P_HIT / DROP_RATE y contadores en CAMP:{id}:METRICS (Redis dialer DB3).
 
         hit=True  → HIT (ANSWERED_PSTN); CONNECT_COUNT == HIT_COUNT
         hit=False, abandon=True  → ABANDON (EXIT_ABANDON / EXIT_TIMEOUT); no toca P_HIT
-        hit=False, abandon=False → FAIL (BUSY, NOANSWER, AMD, …)
+        tech=True → TECH_FAIL_COUNT++; no toca P_HIT / FAIL_COUNT
+        hit=False, abandon=False, tech=False → FAIL (BUSY, NOANSWER, AMD, …)
         """
         if int(id_campaign or 0) == 0:
             return
         hit_flag = 1 if hit else 0
         abandon_flag = 1 if abandon and not hit else 0
+        tech_flag = 1 if tech and not hit and not abandon else 0
         cls.connect_redis_dialer()
         key = f'CAMP:{id_campaign}:METRICS'
         try:
             cls.REDIS_DIALER_CONNECTION.eval(
                 _UPDATE_CAMPAIGN_HIT_LUA, 1, key,
-                hit_flag, abandon_flag, P_HIT_ALPHA, DROP_RATE_ALPHA,
+                hit_flag, abandon_flag, P_HIT_ALPHA, DROP_RATE_ALPHA, tech_flag,
             )
         except Exception:
             logger.exception(
-                'Error updating campaign hit metrics camp=%s hit=%s abandon=%s',
-                id_campaign, hit, abandon,
+                'Error updating campaign hit metrics camp=%s hit=%s abandon=%s tech=%s',
+                id_campaign, hit, abandon, tech,
             )
 
     @classmethod
@@ -2766,6 +3364,7 @@ class AverageWorker(DialerWorker):
             'P_HIT_RATIO': p_hit_ratio,
             'HIT_COUNT': hit_count,
             'FAIL_COUNT': fail_count,
+            'TECH_FAIL_COUNT': _int('TECH_FAIL_COUNT'),
             'ABANDON_COUNT': abandon_count,
             'CONNECT_COUNT': connect_count,
             'DROP_RATE': drop_rate,
@@ -2784,8 +3383,24 @@ class AverageWorker(DialerWorker):
         if int(id_campaign or 0) == 0:
             return False
         cls.connect_redis_dialer()
-        dedup_callid = callid or f"{id_campaign}:{contact_id}:{int(time.time() * 1000)}"
-        dedup_key = cls._calls_decr_dedup_key(id_campaign, contact_id, dedup_callid)
+        # Sin callid (rollback): siempre dedup estable por contacto para que un
+        # ChannelDestroyed/Dial fail posterior no haga doble DECR.
+        if not callid:
+            use_dedup = True
+        contact_marker = f'OML:CALLS:DECR:{id_campaign}:{contact_id}'
+        # Evento con callid tras rollback (u otro finalize del contacto): skip.
+        if use_dedup and callid:
+            try:
+                if cls.REDIS_DIALER_CONNECTION.exists(contact_marker):
+                    logger.debug(
+                        'Skip decrement camp=%s contact=%s callid=%s ctx=%s '
+                        '(contact already finalized)',
+                        id_campaign, contact_id, callid, context,
+                    )
+                    return False
+            except Exception:
+                pass
+        dedup_key = cls._calls_decr_dedup_key(id_campaign, contact_id, callid)
         key_calls = f'OML:CALLS:{id_campaign}:DIALER'
         channels_key = cls._channels_hash_key(id_campaign)
         phase_contact = cls._phase_contact_key(id_campaign, contact_id)
@@ -2832,15 +3447,69 @@ class AverageWorker(DialerWorker):
         if total_after is not None and total_after == 0:
             # posiblemente reset desde negativo ya cubierto en Lua
             pass
+        # Marker contacto (TTL corto): cruza Dial terminal con callid ↔
+        # ChannelDestroyed sin callid (o callid distinto del mismo hangup).
+        # Reserve borra el marker al reintentar el contacto.
+        if use_dedup:
+            try:
+                cls.REDIS_DIALER_CONNECTION.set(
+                    contact_marker, '1', nx=True,
+                    ex=CALLS_CONTACT_DECR_MARKER_TTL_SEC,
+                )
+            except Exception:
+                pass
+        try:
+            cls.REDIS_DIALER_CONNECTION.delete(
+                f'OML:CALLS:RESERVE_TS:{id_campaign}:{contact_id}',
+            )
+        except Exception:
+            pass
+        # Defensa: barrer residuales del contacto (race transition-noop SET
+        # tras DEL de finalize, o phase_callid distinto al pasado).
+        residual = 0
+        try:
+            contact_key = cls._phase_contact_key(id_campaign, contact_id)
+            if cls.REDIS_DIALER_CONNECTION.delete(contact_key):
+                residual += 1
+            for key in cls.REDIS_DIALER_CONNECTION.scan_iter(
+                    match=f'OML:CALLS:PHASE:{id_campaign}:{contact_id}:*',
+                    count=20):
+                cls.REDIS_DIALER_CONNECTION.delete(key)
+                residual += 1
+        except Exception:
+            logger.debug(
+                'Phase residual sweep failed camp=%s contact=%s',
+                id_campaign, contact_id, exc_info=True,
+            )
+        if residual:
+            logger.warning(
+                'Campaign %s: finalize swept %s residual phase key(s) '
+                'contact=%s callid=%s ctx=%s',
+                id_campaign, residual, contact_id, callid, context,
+            )
         cls._publish_calls_count(id_campaign)
         return True
 
     @classmethod
-    def reset_dialer_calls_counter(cls, id_campaign, reason=''):
-        """Reset defensivo de OML:CALLS y fases al finalizar campaña."""
+    def reset_dialer_calls_counter(cls, id_campaign, reason='', force=False):
+        """Reset defensivo de OML:CALLS y fases al finalizar campaña.
+
+        Sin force=True, no resetea si aún hay phase keys / reservas / OML:CALLS
+        (evita huérfanos y over-dial tras auto-finalize prematuro).
+        """
         if int(id_campaign or 0) == 0:
-            return
+            return False
         cls.connect_redis_dialer()
+        if not force and cls._campaign_has_live_calls(id_campaign):
+            phases = cls.get_campaign_channel_phases(id_campaign)
+            logger.warning(
+                'Campaign %s: skip reset OML:CALLS (live calls/reserves) '
+                'ringing=%s waiting=%s oncall=%s (%s)',
+                id_campaign,
+                phases[PHASE_RINGING], phases[PHASE_WAITING_AGENT],
+                phases[PHASE_ONCALL], reason,
+            )
+            return False
         key_calls = f'OML:CALLS:{id_campaign}:DIALER'
         val = cls.REDIS_DIALER_CONNECTION.get(key_calls)
         try:
@@ -2860,11 +3529,46 @@ class AverageWorker(DialerWorker):
             cls._clear_campaign_channel_phases(id_campaign)
             cls._init_campaign_channel_phases(id_campaign)
             cls._publish_calls_count(id_campaign)
+        return True
+
+    @classmethod
+    def _count_recent_reserves(cls, id_campaign, grace_sec=None):
+        """
+        Cantidad de reservas INCR dentro de la ventana de gracia corta
+        (en tránsito entre dialer y originate de Asterisk, <= 8s y aún en RINGING).
+        """
+        grace_sec = grace_sec if grace_sec is not None else min(RESERVE_GRACE_SEC, 8)
+        cls.connect_redis_dialer()
+        pattern = f'OML:CALLS:RESERVE_TS:{id_campaign}:*'
+        prefix = f'OML:CALLS:RESERVE_TS:{id_campaign}:'
+        now = int(time.time())
+        count = 0
+        try:
+            for key in cls.REDIS_DIALER_CONNECTION.scan_iter(match=pattern, count=100):
+                key_s = cls._decode_redis_str(key) or ''
+                contact_id = key_s[len(prefix):] if key_s.startswith(prefix) else ''
+                ts_raw = cls.REDIS_DIALER_CONNECTION.get(key)
+                if ts_raw is None:
+                    continue
+                try:
+                    if now - int(ts_raw) >= grace_sec:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                if contact_id:
+                    phase_key = cls._phase_contact_key(id_campaign, contact_id)
+                    ph = cls.REDIS_DIALER_CONNECTION.get(phase_key)
+                    if ph is not None and cls._decode_redis_str(ph) != PHASE_RINGING:
+                        continue
+                count += 1
+        except Exception as e:
+            logger.debug('Reserve grace count failed camp %s: %s', id_campaign, e)
+        return count
 
     @classmethod
     def _campaign_has_recent_reserve(cls, id_campaign, grace_sec=None):
         """True si hay reserva INCR reciente (evita corrección agresiva en audit)."""
-        grace_sec = grace_sec if grace_sec is not None else RESERVE_GRACE_SEC
+        grace = grace_sec if grace_sec is not None else RESERVE_GRACE_SEC
         cls.connect_redis_dialer()
         pattern = f'OML:CALLS:RESERVE_TS:{id_campaign}:*'
         now = int(time.time())
@@ -2874,7 +3578,7 @@ class AverageWorker(DialerWorker):
                 if ts_raw is None:
                     continue
                 try:
-                    if now - int(ts_raw) < grace_sec:
+                    if now - int(ts_raw) < grace:
                         return True
                 except (TypeError, ValueError):
                     continue
@@ -2906,6 +3610,54 @@ class AverageWorker(DialerWorker):
     @classmethod
     def _acd_node_ringing_key(cls, node_id):
         return f'OML:ACD:{node_id}:RINGING'
+
+    @classmethod
+    def _acd_node_stale_ticks_key(cls, node_id):
+        return f'OML:ACD:NODE:{node_id}:STALE_TICKS'
+
+    @classmethod
+    def _evict_stale_acd_nodes(cls, redis_conn, stale_nodes, fresh_nodes):
+        """
+        Tras ACD_STALE_EVICT_TICKS audits sin HB → SREM de OML:ACD:NODES y
+        limpia foto/HB del nodo. Nodos fresh resetean el contador.
+        Retorna lista de node_id expulsados.
+        """
+        try:
+            evict_after = max(1, int(ACD_STALE_EVICT_TICKS))
+        except (TypeError, ValueError):
+            evict_after = 3
+        evicted = []
+        r = redis_conn
+        for node_id in fresh_nodes:
+            try:
+                r.delete(cls._acd_node_stale_ticks_key(node_id))
+            except Exception:
+                pass
+        for node_id in stale_nodes:
+            try:
+                ticks_key = cls._acd_node_stale_ticks_key(node_id)
+                ticks = int(r.incr(ticks_key))
+                r.expire(ticks_key, 3600)
+                if ticks < evict_after:
+                    continue
+                r.srem(ACD_NODES_SET_KEY, node_id)
+                r.delete(
+                    cls._acd_node_channels_key(node_id),
+                    cls._acd_node_ringing_key(node_id),
+                    cls._acd_node_heartbeat_key(node_id),
+                    ticks_key,
+                )
+                evicted.append(node_id)
+                logger.warning(
+                    'ACD node evicted from OML:ACD:NODES: node=%s '
+                    'stale_ticks=%s (no heartbeat)',
+                    node_id, ticks,
+                )
+            except Exception:
+                logger.exception(
+                    'ACD stale eviction failed node=%s', node_id,
+                )
+        return evicted
 
     @classmethod
     def _audit_streak_key(cls, camp_id, kind='calls'):
@@ -2943,8 +3695,9 @@ class AverageWorker(DialerWorker):
 
         Retorna (cluster_complete, counts, ringing).
         - NODES vacío o excepción → (False, {}, {}): no reconciliar.
-        - Nodo sin heartbeat → cluster incompleto; su foto no entra en la suma.
-        - Suma parcial (incompleto) sirve como cota inferior para undercount.
+        - Nodo sin heartbeat → no suma su foto; tras ACD_STALE_EVICT_TICKS se
+          expulsa de OML:ACD:NODES (desbloquea audit-down).
+        - Suma parcial (incompleto con fresh>0) es cota inferior.
         """
         try:
             cls.connect_redis_dialer()
@@ -2970,6 +3723,12 @@ class AverageWorker(DialerWorker):
                 else:
                     fresh_nodes.append(node_id)
 
+            if stale_nodes:
+                evicted = cls._evict_stale_acd_nodes(r, stale_nodes, fresh_nodes)
+                if evicted:
+                    stale_set = set(evicted)
+                    stale_nodes = [n for n in stale_nodes if n not in stale_set]
+
             counts = {}
             ringing = {}
             for node_id in fresh_nodes:
@@ -2988,6 +3747,12 @@ class AverageWorker(DialerWorker):
                     'ACD snapshot audit: incomplete cluster stale=%s fresh=%s',
                     stale_nodes, fresh_nodes,
                 )
+            elif not fresh_nodes:
+                logger.warning(
+                    'ACD snapshot audit: no fresh nodes after eviction; '
+                    'skip reconcile',
+                )
+                return False, {}, {}
             return cluster_complete, counts, ringing
         except Exception as e:
             logger.error(
@@ -3084,33 +3849,40 @@ class AverageWorker(DialerWorker):
                 cls._clear_audit_streak(camp_id, kind='ringing')
         else:
             # redis_ringing > ringing_target
-            if not cluster_complete:
+            recent_reserves = (
+                cls._count_recent_reserves(camp_id)
+                if cls._campaign_has_recent_reserve(camp_id)
+                else 0
+            )
+            safe_ringing_target = ringing_target + recent_reserves
+            if redis_ringing <= safe_ringing_target:
                 cls._clear_audit_streak(camp_id, kind='ringing')
                 logger.debug(
-                    'Audit: skip RINGING down camp %s (incomplete cluster) '
+                    'Audit: skip RINGING camp %s (recent reserve=%s) '
                     'redis=%s asterisk=%s',
-                    camp_id, redis_ringing, ringing_target,
-                )
-            elif cls._campaign_has_recent_reserve(camp_id):
-                cls._clear_audit_streak(camp_id, kind='ringing')
-                logger.debug(
-                    'Audit: skip RINGING camp %s (recent reserve) '
-                    'redis=%s asterisk=%s',
-                    camp_id, redis_ringing, ringing_target,
+                    camp_id, recent_reserves, redis_ringing, ringing_target,
                 )
             else:
+                down_needed = (
+                    AUDIT_DOWN_STREAK_TICKS
+                    if cluster_complete
+                    else max(1, int(AUDIT_INCOMPLETE_DOWN_STREAK_TICKS))
+                )
                 n = cls._bump_audit_streak(
-                    camp_id, AUDIT_STREAK_DIR_DOWN, ringing_target,
+                    camp_id, AUDIT_STREAK_DIR_DOWN, safe_ringing_target,
                     kind='ringing',
                 )
-                if n >= AUDIT_DOWN_STREAK_TICKS:
+                if n >= down_needed:
                     logger.warning(
                         'Audit corrected RINGING camp %s: redis=%s asterisk=%s '
-                        '(down streak=%s)',
-                        camp_id, redis_ringing, ringing_target, n,
+                        'recent_reserves=%s -> set %s (down streak=%s '
+                        'complete=%s)',
+                        camp_id, redis_ringing, ringing_target,
+                        recent_reserves, safe_ringing_target, n,
+                        cluster_complete,
                     )
                     cls.REDIS_DIALER_CONNECTION.hset(
-                        channels_key, PHASE_RINGING, ringing_target,
+                        channels_key, PHASE_RINGING, safe_ringing_target,
                     )
                     cls._clear_audit_streak(camp_id, kind='ringing')
 
@@ -3128,9 +3900,35 @@ class AverageWorker(DialerWorker):
                 phases_after[PHASE_ONCALL],
                 expected_non_ringing,
             )
+            recent = (
+                cls._count_recent_reserves(camp_id)
+                if cls._campaign_has_recent_reserve(camp_id)
+                else 0
+            )
+            safe_non_ringing = expected_non_ringing + recent
+            if cluster_complete and non_ringing > safe_non_ringing:
+                excess = non_ringing - safe_non_ringing
+                w_cur = phases_after[PHASE_WAITING_AGENT]
+                o_cur = phases_after[PHASE_ONCALL]
+                dec_w = min(w_cur, excess)
+                if dec_w > 0:
+                    w_cur -= dec_w
+                    excess -= dec_w
+                    cls.REDIS_DIALER_CONNECTION.hset(
+                        channels_key, PHASE_WAITING_AGENT, w_cur,
+                    )
+                dec_o = min(o_cur, excess)
+                if dec_o > 0:
+                    o_cur -= dec_o
+                    cls.REDIS_DIALER_CONNECTION.hset(
+                        channels_key, PHASE_ONCALL, o_cur,
+                    )
 
     @classmethod
-    @timed_lru_cache(seconds=600, maxsize=128)
+    @timed_lru_cache(
+        seconds=int(os.getenv('DIALER_CAMPAIGN_CACHE_TTL_SEC', '15')),
+        maxsize=128,
+    )
     def get_campaign_max_available_channels(cls, id_campaign):
         with cls.get_dialer_connection() as conn_dialer:
             cursor_dialer = conn_dialer.cursor()
@@ -3201,7 +3999,10 @@ class AverageWorker(DialerWorker):
     DIAL_MODE_PREDICTIVE = 'predictive'
 
     @classmethod
-    @timed_lru_cache(seconds=600, maxsize=128)
+    @timed_lru_cache(
+        seconds=int(os.getenv('DIALER_CAMPAIGN_CACHE_TTL_SEC', '15')),
+        maxsize=128,
+    )
     def get_boost_factor(cls, id_campaign):
         with cls.get_dialer_connection() as conn_dialer:
             cursor_dialer = conn_dialer.cursor()
@@ -3211,7 +4012,10 @@ class AverageWorker(DialerWorker):
             return boost_factor
 
     @classmethod
-    @timed_lru_cache(seconds=600, maxsize=128)
+    @timed_lru_cache(
+        seconds=int(os.getenv('DIALER_CAMPAIGN_CACHE_TTL_SEC', '15')),
+        maxsize=128,
+    )
     def get_predictive_model(cls, id_campaign):
         with cls.get_dialer_connection() as conn_dialer:
             cursor_dialer = conn_dialer.cursor()
@@ -3236,6 +4040,9 @@ class AverageWorker(DialerWorker):
             return f'CUSTOMDIALERDST={customdialerdst!r}'
         return None
 
+    # Reason when campaign wants predictive but global FF is off → progressive R=1.
+    REASON_PREDICTIVE_FF_DISABLED_R1 = 'predictive_ff_disabled_r1'
+
     @classmethod
     def resolve_dial_mode(cls, id_campaign):
         """
@@ -3244,7 +4051,8 @@ class AverageWorker(DialerWorker):
         Priority:
           1) power: OML:CAMP CUSTOMDIALERDST not in ('', '0') or VOICEBOT=true
           2) predictive: initial_predictive_model=true AND DIALER_PREDICTIVE_ENABLED
-          3) progressive: otherwise (incluye FF off con flag de campaña)
+          3) progressive R=1: predictive flag but FF off (ignora boost)
+          4) progressive: otherwise (con boost de campaña)
         """
         power_reason = cls._power_dialer_reason(id_campaign)
         if power_reason is not None:
@@ -3254,7 +4062,7 @@ class AverageWorker(DialerWorker):
                 return cls.DIAL_MODE_PREDICTIVE, 'initial_predictive_model=True'
             return (
                 cls.DIAL_MODE_PROGRESSIVE,
-                'initial_predictive_model=True but DIALER_PREDICTIVE_ENABLED=false',
+                cls.REASON_PREDICTIVE_FF_DISABLED_R1,
             )
         return cls.DIAL_MODE_PROGRESSIVE, 'initial_predictive_model=False'
 
@@ -3304,11 +4112,17 @@ class AverageWorker(DialerWorker):
                 id_campaign)
             return 0
 
-        phases = cls.get_campaign_channel_phases(id_campaign)
-        unassigned = (
+        active_snap, phases = cls._get_calls_and_phases(id_campaign)
+        if active_snap is not None:
+            active_channels = active_snap
+        raw_unassigned = (
             int(phases.get(PHASE_RINGING, 0) or 0)
             + int(phases.get(PHASE_WAITING_AGENT, 0) or 0)
         )
+        max_possible_unassigned = max(
+            0, int(active_channels) - int(phases.get(PHASE_ONCALL, 0) or 0),
+        )
+        unassigned = min(raw_unassigned, max_possible_unassigned)
         target_concurrent_calls = available_agents_score * boost_factor
         target_capped = min(ceil(target_concurrent_calls), campaign_max_available_channels)
         calls_to_dial = target_capped - unassigned
@@ -3429,17 +4243,197 @@ class AverageWorker(DialerWorker):
             )
 
     @classmethod
-    def _update_throttle_streak(cls, id_campaign, drop_rate, d_max):
+    def _touch_throttle_state_ttl(cls, id_campaign):
+        """Renueva TTL de latch/over_since si el kill-switch sigue activo."""
+        if int(id_campaign or 0) == 0:
+            return False
+        try:
+            cls.connect_redis_dialer()
+            r = cls.REDIS_DIALER_CONNECTION
+            latch_key = f'CAMP:{id_campaign}:THROTTLE_LATCH'
+            over_key = f'CAMP:{id_campaign}:THROTTLE_OVER_SINCE'
+            if not r.exists(latch_key):
+                return False
+            ttl = max(1, int(THROTTLE_STATE_TTL_SEC))
+            pipe = r.pipeline()
+            pipe.expire(latch_key, ttl)
+            pipe.expire(over_key, ttl)
+            pipe.execute()
+            return True
+        except Exception:
+            logger.debug(
+                'Campaign %s: touch throttle TTL failed', id_campaign, exc_info=True,
+            )
+            return False
+
+    @classmethod
+    def _ast_channels_for_campaign(cls, id_campaign):
+        """Foto Asterisk agregada (OML:ACD:*:CHANNELS) para una campaña; None si n/d."""
+        try:
+            _complete, counts, _ringing = cls._fetch_acd_snapshot_counts()
+        except Exception:
+            logger.debug(
+                'Campaign %s: ACD snapshot for guardrail failed',
+                id_campaign, exc_info=True,
+            )
+            return None
+        try:
+            cid = int(id_campaign)
+        except (TypeError, ValueError):
+            return None
+        if cid not in counts:
+            # Sin foto aún: tratar como 0 canales Ast (delta = CALLS).
+            return 0
+        try:
+            return max(0, int(counts.get(cid) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _caps_batch_should_abort(cls, id_campaign, campaign_max, dials_done=0):
         """
-        Actualiza CAMP:{id}:THROTTLE_STREAK / THROTTLE_LATCH con histéresis.
+        Revalida mid-CAPS: sin headroom o campaña inactiva → abortar. Tras ≥1
+        originate, también si el kill-switch está latched. Siempre renueva TTL
+        del latch sin incrementar THROTTLE_STREAK a mitad de lote.
+        P0: también aborta por backlog process-event / drift CALLS−Ast / phases.
+        """
+        try:
+            cls.connect_redis_dialer()
+            dist_status = cls.REDIS_DIALER_CONNECTION.hget(
+                f'CAMP:{id_campaign}:DISTRIBUTION', 'STATUS',
+            )
+            if dist_status is not None and str(dist_status) == '0':
+                return True, 'campaign_inactive'
+        except Exception:
+            pass
+        active, phases = cls._get_calls_and_phases(id_campaign)
+        try:
+            max_ch = int(campaign_max or 0)
+        except (TypeError, ValueError):
+            max_ch = 0
+        if max_ch > 0 and int(active) >= max_ch:
+            return True, 'max_channels'
+
+        try:
+            phase_total = int((phases or {}).get('TOTAL') or 0)
+        except (TypeError, ValueError):
+            phase_total = 0
+        block, g_reason = evaluate_backpressure_guardrails(
+            active_calls=int(active or 0),
+            phase_total=phase_total,
+            ast_channels=cls._ast_channels_for_campaign(id_campaign),
+        )
+        if block:
+            return True, g_reason or 'origin_guardrail'
+
+        latched = cls._touch_throttle_state_ttl(id_campaign)
+        if int(dials_done or 0) <= 0:
+            return False, ''
+        if not latched:
+            return False, ''
+        drop_rate = cls.get_campaign_drop_rate(id_campaign)
+        exit_thr = float(THROTTLE_EXIT_RATIO) * float(MAX_ABANDON_RATE)
+        if drop_rate is not None and float(drop_rate) < exit_thr:
+            throttle = cls._update_throttle_streak(
+                id_campaign, drop_rate, MAX_ABANDON_RATE,
+            )
+            cls._log_throttle_event(id_campaign, throttle, drop_rate)
+            if not (throttle.get('force_throttle') or throttle.get('latched')):
+                return False, ''
+        return True, 'throttle'
+
+    @classmethod
+    def _log_throttle_event(cls, id_campaign, throttle, drop_rate):
+        """Log THROTTLE_ENGAGED / THROTTLE_CLEARED at warning level."""
+        event = (throttle or {}).get('event')
+        if event == 'THROTTLE_ENGAGED':
+            logger.warning(
+                "Campaign %s: THROTTLE_ENGAGED over_sec=%s streak_sec=%s "
+                "drop_rate=%s d_max=%s exit_ratio=%s",
+                id_campaign,
+                throttle.get('over_sec', throttle.get('streak')),
+                THROTTLE_STREAK_SEC,
+                drop_rate,
+                MAX_ABANDON_RATE,
+                THROTTLE_EXIT_RATIO,
+            )
+        elif event == 'THROTTLE_CLEARED':
+            logger.warning(
+                "Campaign %s: THROTTLE_CLEARED over_sec=%s "
+                "drop_rate=%s d_max=%s exit_ratio=%s",
+                id_campaign,
+                throttle.get('over_sec', throttle.get('streak')),
+                drop_rate,
+                MAX_ABANDON_RATE,
+                THROTTLE_EXIT_RATIO,
+            )
+
+    @classmethod
+    def _throttle_fail_closed(cls, id_campaign, event=None):
+        """Fail-closed: forzar R=1 si Redis falla o el estado es ilegible."""
+        return {
+            'streak': 0,
+            'over_sec': 0,
+            'latched': True,
+            'force_throttle': True,
+            'event': event,
+        }
+
+    @classmethod
+    def _compute_throttle_drop_rate(cls, metrics, ewma_drop, latched=False):
+        """
+        D efectivo para kill-switch: max(EWMA, acumulado) si HIT_COUNT >= MIN_HITS.
+
+        Si hits < min y no latched → None (caller no engage; γ sigue con EWMA).
+        Si hits < min y latched → max(ewma, cum) para histéresis de salida.
+        """
+        metrics = metrics or {}
+        try:
+            hits = int(metrics.get('HIT_COUNT') or 0)
+        except (TypeError, ValueError):
+            hits = 0
+        try:
+            min_hits = int(THROTTLE_MIN_HITS)
+        except (TypeError, ValueError):
+            min_hits = 20
+        min_hits = max(0, min_hits)
+
+        cum = None
+        try:
+            if hits > 0 and metrics.get('DROP_RATE') is not None:
+                cum = max(0.0, float(metrics.get('DROP_RATE')))
+        except (TypeError, ValueError):
+            cum = None
+
+        ewma = None
+        if ewma_drop is not None:
+            try:
+                ewma = max(0.0, float(ewma_drop))
+            except (TypeError, ValueError):
+                ewma = None
+
+        if hits < min_hits and not latched:
+            return None
+
+        vals = [v for v in (ewma, cum) if v is not None]
+        if not vals:
+            return None
+        return max(vals)
+
+    @classmethod
+    def _update_throttle_streak(cls, id_campaign, drop_rate, d_max, now_ts=None):
+        """
+        Actualiza CAMP:{id}:THROTTLE_OVER_SINCE / THROTTLE_LATCH (wall-clock).
 
         Returns dict:
-          streak, latched, force_throttle, event
+          streak (= over_sec alias), over_sec, latched, force_throttle, event
           (event in {None, 'THROTTLE_ENGAGED', 'THROTTLE_CLEARED'})
-        Fail-open: errores Redis → force_throttle=False, streak=0.
+        Fail-closed: errores Redis → force_throttle=True.
+        drop_rate=None: no trata D=0 (no limpia latch); lee estado existente.
         """
         empty = {
             'streak': 0,
+            'over_sec': 0,
             'latched': False,
             'force_throttle': False,
             'event': None,
@@ -3447,17 +4441,52 @@ class AverageWorker(DialerWorker):
         if int(id_campaign or 0) == 0:
             return empty
 
+        over_key = f'CAMP:{id_campaign}:THROTTLE_OVER_SINCE'
+        latch_key = f'CAMP:{id_campaign}:THROTTLE_LATCH'
+        if now_ts is None:
+            now_ts = time.time()
+        try:
+            now_f = float(now_ts)
+        except (TypeError, ValueError):
+            now_f = time.time()
+
+        def _over_sec_from_redis(r):
+            raw = r.get(over_key)
+            try:
+                since = float(raw)
+            except (TypeError, ValueError):
+                return 0
+            return max(0, int(now_f - since))
+
+        # Sin muestra de drop: no llamar Lua con d=0 (evitar clear accidental).
+        if drop_rate is None:
+            try:
+                cls.connect_redis_dialer()
+                r = cls.REDIS_DIALER_CONNECTION
+                latched = bool(r.exists(latch_key))
+                over_sec = _over_sec_from_redis(r) if latched or r.exists(over_key) else 0
+                return {
+                    'streak': over_sec,
+                    'over_sec': over_sec,
+                    'latched': latched,
+                    'force_throttle': latched,
+                    'event': None,
+                }
+            except Exception:
+                logger.exception(
+                    'Error reading throttle state (drop_rate=None) camp=%s',
+                    id_campaign,
+                )
+                return cls._throttle_fail_closed(id_campaign)
+
         try:
             d_max_f = float(d_max)
         except (TypeError, ValueError):
             d_max_f = 0.0
-        if drop_rate is None:
+        try:
+            d = max(0.0, float(drop_rate))
+        except (TypeError, ValueError):
             d = 0.0
-        else:
-            try:
-                d = max(0.0, float(drop_rate))
-            except (TypeError, ValueError):
-                d = 0.0
 
         try:
             exit_ratio = float(THROTTLE_EXIT_RATIO)
@@ -3467,60 +4496,38 @@ class AverageWorker(DialerWorker):
         exit_thr = exit_ratio * d_max_f if d_max_f > 0 else 0.0
 
         try:
-            k = int(THROTTLE_STREAK_K)
+            streak_sec = int(THROTTLE_STREAK_SEC)
         except (TypeError, ValueError):
-            k = 5
-        k = max(1, k)
+            try:
+                streak_sec = int(THROTTLE_STREAK_K)
+            except (TypeError, ValueError):
+                streak_sec = 5
+        streak_sec = max(1, streak_sec)
 
-        streak_key = f'CAMP:{id_campaign}:THROTTLE_STREAK'
-        latch_key = f'CAMP:{id_campaign}:THROTTLE_LATCH'
-        ttl = PACING_SNAPSHOT_TTL_SEC
+        try:
+            ttl = int(THROTTLE_STATE_TTL_SEC)
+        except (TypeError, ValueError):
+            ttl = 300
+        ttl = max(1, ttl)
 
         try:
             cls.connect_redis_dialer()
-            r = cls.REDIS_DIALER_CONNECTION
-            latched = bool(r.get(latch_key))
-            try:
-                streak = int(float(r.get(streak_key) or 0))
-            except (TypeError, ValueError):
-                streak = 0
-            event = None
-            force_throttle = False
-
-            if latched:
-                if d < exit_thr:
-                    pipe = r.pipeline()
-                    pipe.delete(latch_key)
-                    pipe.set(streak_key, 0)
-                    pipe.expire(streak_key, ttl)
-                    pipe.execute()
-                    latched = False
-                    streak = 0
-                    event = 'THROTTLE_CLEARED'
-                else:
-                    force_throttle = True
-                    pipe = r.pipeline()
-                    pipe.expire(latch_key, ttl)
-                    pipe.expire(streak_key, ttl)
-                    pipe.execute()
-            else:
-                if d_max_f > 0 and d >= d_max_f:
-                    streak = int(r.incr(streak_key))
-                    r.expire(streak_key, ttl)
-                    if streak >= k:
-                        r.set(latch_key, '1', ex=ttl)
-                        latched = True
-                        force_throttle = True
-                        event = 'THROTTLE_ENGAGED'
-                else:
-                    if streak != 0:
-                        r.set(streak_key, 0, ex=ttl)
-                    else:
-                        r.expire(streak_key, ttl)
-                    streak = 0
-
+            result = cls.REDIS_DIALER_CONNECTION.eval(
+                _THROTTLE_UPDATE_LUA, 2,
+                over_key, latch_key,
+                d, d_max_f, exit_thr, streak_sec, ttl, now_f,
+            )
+            over_sec = int(result[0]) if result else 0
+            latched = bool(int(result[1])) if result and len(result) > 1 else False
+            force_throttle = bool(int(result[2])) if result and len(result) > 2 else False
+            event = result[3] if result and len(result) > 3 else ''
+            if isinstance(event, bytes):
+                event = event.decode('utf-8', errors='replace')
+            if not event:
+                event = None
             return {
-                'streak': streak,
+                'streak': over_sec,
+                'over_sec': over_sec,
                 'latched': latched,
                 'force_throttle': force_throttle,
                 'event': event,
@@ -3529,7 +4536,7 @@ class AverageWorker(DialerWorker):
             logger.exception(
                 'Error updating throttle streak camp=%s', id_campaign,
             )
-            return empty
+            return cls._throttle_fail_closed(id_campaign)
 
     @classmethod
     def _allowed_parallel_predictive(
@@ -3538,13 +4545,19 @@ class AverageWorker(DialerWorker):
         """
         Predictive pacing (H5).
 
-        C_dial = max(0, floor(((A_free + A_expected - C_ringing * P_hit) / P_hit) * gamma))
+        C_dial vía compute_c_dial (predictive_pacer):
+          γ > 1: floor(((A_free + A_expected) * γ - C_ringing * P_hit) / P_hit)
+          γ ≤ 1: floor(((A_free + A_expected - C_ringing * P_hit) / P_hit) * γ)
+        luego apply_channel_caps(C_dial, max_channels - active).
 
         Warm-up / sin P_hit / kill-switch latched (streak ≥ K): progresivo R=1.
         Aggressiveness = initial_boost_factor (techo de gamma en zona sana).
         """
         snapshot = cls.get_campaign_agent_snapshot(id_campaign)
-        phases = cls.get_campaign_channel_phases(id_campaign)
+        # Snapshot CALLS+CHANNELS en un pipeline (misma vista para C_ringing).
+        active_snap, phases = cls._get_calls_and_phases(id_campaign)
+        if active_snap is not None:
+            active_channels = active_snap
         att_count = cls.get_campaign_att_count(id_campaign)
         warmup = att_count < WARM_UP_SAMPLE_SIZE
         drop_rate = cls.get_campaign_drop_rate(id_campaign)
@@ -3552,29 +4565,49 @@ class AverageWorker(DialerWorker):
         metrics = cls.get_campaign_metrics(id_campaign) or {}
         capacity = cls.get_campaign_a_expected(id_campaign, snapshot=snapshot)
         aggressiveness = cls._normalize_boost_factor(cls.get_boost_factor(id_campaign))
-        c_ringing = phases.get(PHASE_RINGING, 0)
+        raw_ringing = int(phases.get(PHASE_RINGING, 0) or 0)
+        waiting_agent = int(phases.get(PHASE_WAITING_AGENT, 0) or 0)
+        oncall = int(phases.get(PHASE_ONCALL, 0) or 0)
+        max_possible_ringing = max(0, int(active_channels) - waiting_agent - oncall)
+        c_ringing = min(raw_ringing, max_possible_ringing)
 
         throttle = {
             'streak': 0,
+            'over_sec': 0,
             'latched': False,
             'force_throttle': False,
             'event': None,
         }
+        drop_rate_cum = None
+        d_throttle = None
+        hit_count_metrics = int(metrics.get('HIT_COUNT') or 0)
+        try:
+            if metrics.get('DROP_RATE') is not None and hit_count_metrics > 0:
+                drop_rate_cum = float(metrics.get('DROP_RATE'))
+        except (TypeError, ValueError):
+            drop_rate_cum = None
+
         if not warmup and p_hit is not None:
-            throttle = cls._update_throttle_streak(
-                id_campaign, drop_rate, MAX_ABANDON_RATE,
+            # Peek latch without clearing (drop_rate=None path).
+            peek = cls._update_throttle_streak(
+                id_campaign, None, MAX_ABANDON_RATE,
             )
-            if throttle.get('event') == 'THROTTLE_ENGAGED':
-                logger.warning(
-                    "Campaign %s: THROTTLE_ENGAGED streak=%s k=%s "
-                    "drop_rate=%s d_max=%s exit_ratio=%s",
-                    id_campaign,
-                    throttle.get('streak'),
-                    THROTTLE_STREAK_K,
-                    drop_rate,
-                    MAX_ABANDON_RATE,
-                    THROTTLE_EXIT_RATIO,
+            d_throttle = cls._compute_throttle_drop_rate(
+                metrics, drop_rate, latched=bool(peek.get('latched')),
+            )
+            if d_throttle is None and peek.get('latched'):
+                # Sin D usable: conservar latch (no clear con d=0).
+                throttle = peek
+            elif d_throttle is None:
+                # hits < MIN: no engage; limpia over_since si había.
+                throttle = cls._update_throttle_streak(
+                    id_campaign, 0.0, MAX_ABANDON_RATE,
                 )
+            else:
+                throttle = cls._update_throttle_streak(
+                    id_campaign, d_throttle, MAX_ABANDON_RATE,
+                )
+            cls._log_throttle_event(id_campaign, throttle, d_throttle)
 
         decision = decide_predictive_pace(
             a_free=snapshot.get('a_free', 0),
@@ -3588,6 +4621,8 @@ class AverageWorker(DialerWorker):
             p_hit_floor=HIT_RATE_FLOOR,
             gamma_floor=GAMMA_THROTTLE_FLOOR,
             force_throttle=bool(throttle.get('force_throttle')),
+            c_waiting=waiting_agent,
+            max_dial_ratio=MAX_DIAL_RATIO,
         )
         busy_elapsed_sample = [
             (item['agent_id'], item['status'], item['elapsed_sec'],
@@ -3607,10 +4642,16 @@ class AverageWorker(DialerWorker):
             GAMMA=decision['gamma'],
             P_HIT=p_hit,
             DROP_RATE=drop_rate,
+            DROP_RATE_CUM=drop_rate_cum if drop_rate_cum is not None else '',
+            HIT_COUNT=hit_count_metrics,
+            D_THROTTLE=d_throttle if d_throttle is not None else '',
             A_FREE=snapshot.get('a_free', 0),
             A_EXPECTED=capacity.get('a_expected', 0.0),
             C_RINGING=c_ringing,
+            C_WAITING=waiting_agent,
+            MAX_DIAL_RATIO=MAX_DIAL_RATIO,
             THROTTLE_STREAK=throttle.get('streak', 0),
+            THROTTLE_OVER_SEC=throttle.get('over_sec', throttle.get('streak', 0)),
             THROTTLE_LATCHED=1 if throttle.get('latched') else 0,
             EVENT=throttle.get('event') or '',
         )
@@ -3747,6 +4788,14 @@ class AverageWorker(DialerWorker):
                 id_campaign, active_channels, campaign_max_available_channels,
                 num_available_channels)
 
+        # Kill-switch global: predictive flag + FF off → R=1 (no boost).
+        if reason == cls.REASON_PREDICTIVE_FF_DISABLED_R1:
+            return cls._allowed_parallel_progressive(
+                id_campaign, active_channels, campaign_max_available_channels,
+                num_available_channels, boost_factor=1.0,
+                mode_label='PREDICTIVE_DISABLED_R1',
+            )
+
         boost_factor = cls._normalize_boost_factor(cls.get_boost_factor(id_campaign))
         return cls._allowed_parallel_progressive(
             id_campaign, active_channels, campaign_max_available_channels,
@@ -3758,6 +4807,8 @@ class AverageWorker(DialerWorker):
             id_campaign, contacts_attempts_number))
         with cls.get_dialer_connection() as conn_dialer:
             cursor_dialer = conn_dialer.cursor()
+            # FOR UPDATE SKIP LOCKED: dos workers concurrentes no eligen
+            # la misma fila (red de seguridad junto al lease Redis).
             cursor_dialer.execute("""UPDATE contact_in_campaign as cc
                                      SET status = %s,
                                      schedule_aborted = false
@@ -3766,8 +4817,11 @@ class AverageWorker(DialerWorker):
                                      FROM ONLY contact_in_campaign
                                      WHERE id_campaign = %s and
                                      (status = %s OR schedule_aborted = true)
-                                     LIMIT %s) AND co.id = cc.id_contact
-                                     RETURNING cc.id_contact, cc.id_campaign, co.phone;""",
+                                     ORDER BY id
+                                     LIMIT %s
+                                     FOR UPDATE SKIP LOCKED) AND co.id = cc.id_contact
+                                     RETURNING cc.id_contact, cc.id_campaign,
+                                     COALESCE(cc.phone_numbers_list[cc.phone_number_index + 1], co.phone);""",
                                   (STATUS_SELECTED_CALL, id_campaign, STATUS_CREATED,
                                    contacts_attempts_number))
             contacts = cursor_dialer.fetchall()
@@ -3891,7 +4945,7 @@ class AverageWorker(DialerWorker):
                         # --- ROLLBACK DE RESERVA ---
                         cls._decrement_calls_once(
                             id_campaign, id_contact, None,
-                            context='gearman_dial_rollback', use_dedup=False,
+                            context='gearman_dial_rollback', use_dedup=True,
                         )
                         logger.error(
                             "Error sending dial job to Gearman, "
@@ -3909,7 +4963,7 @@ class AverageWorker(DialerWorker):
                     # No está permitido llamar (horario), liberamos la reserva
                     cls._decrement_calls_once(
                         id_campaign, id_contact, None,
-                        context='not_allowed_hours', use_dedup=False,
+                        context='not_allowed_hours', use_dedup=True,
                     )
 
                     # Marcamos para reintento
@@ -3928,7 +4982,7 @@ class AverageWorker(DialerWorker):
                 )
                 cls._decrement_calls_once(
                     id_campaign, id_contact, None,
-                    context='campaign_not_active', use_dedup=False,
+                    context='campaign_not_active', use_dedup=True,
                 )
                 cursor_dialer.execute(
                     'UPDATE contact_in_campaign SET schedule_aborted = true '
@@ -3975,19 +5029,19 @@ class AverageWorker(DialerWorker):
         cls.connect_redis_dialer()
         cls.connect_redis_oml()
         id_campaign = cls.decode_payload(job.data)['id_campaign']
-        first_running_job = cls.check_running_job(id_campaign)
-        if not first_running_job:
+        lock_token = cls.check_running_job(id_campaign)
+        if not lock_token:
             return b'Campaign already running'
         logger.debug(f'Campaign {id_campaign}: resuming the campaign')
         try:
-            cls.process_campaign_inside(id_campaign)
+            cls.process_campaign_inside(id_campaign, lock_token=lock_token)
             response = f'Campaign {id_campaign} process ended!'
             response = json.dumps({'msg': response})
             return bytes(response, encoding='UTF8')
         except Exception as e:
             raise e
         finally:
-            cls.REDIS_DIALER_CONNECTION.delete(f'PROCESS-CAMPAIGN-{id_campaign}')
+            cls._release_process_campaign_lock(id_campaign, lock_token)
 
     @classmethod
     @timed_lru_cache(seconds=600, maxsize=128)
@@ -4002,7 +5056,12 @@ class AverageWorker(DialerWorker):
                 'SELECT prefix FROM campaign WHERE'
                 ' id = %s;',
                 (id_campaign,))
-            return cursor_dialer.fetchone()
+            row = cursor_dialer.fetchone()
+            # fetchone() → (NULL,) es truthy y rompe phone_to_dial con
+            # str((None,)) + número. Tratar NULL/vacío como sin prefijo.
+            if not row or row[0] is None or row[0] == '':
+                return None
+            return row
 
     @classmethod
     @timed_lru_cache(seconds=600, maxsize=128)
@@ -4212,17 +5271,26 @@ class AverageWorker(DialerWorker):
             return b'Event was processed'
 
         # ----- ChannelDestroyed (canal PSTN liberado): decrementar y reportar -----
+        # Tras Dial AMD / otros CALLS_DECR_DIAL_STATUSES el DECR ya ocurrió: dedup
+        # → no-op y no re-encolar send-reports (fan-out AMD).
         if event_type in ('ChannelDestroyed', 'ChannelDestroy'):
             if call_type == 'to_pstn' and int(id_campaign or 0) != 0:
-                cls._decrement_calls_once(
+                decremented = cls._decrement_calls_once(
                     id_campaign, contact_id, callid, context='ChannelDestroyed',
                 )
-                cls.GM_CLIENT.submit_job('send-reports', job.data, background=True)
-                logger.debug(
-                    "process_event [%s]: ChannelDestroyed to_pstn, "
-                    "decrement y send-reports | campaign=%s",
-                    callid, id_campaign,
-                )
+                if decremented:
+                    cls.GM_CLIENT.submit_job('send-reports', job.data, background=True)
+                    logger.debug(
+                        "process_event [%s]: ChannelDestroyed to_pstn, "
+                        "decrement y send-reports | campaign=%s",
+                        callid, id_campaign,
+                    )
+                else:
+                    logger.debug(
+                        "process_event [%s]: ChannelDestroyed to_pstn, "
+                        "skip send-reports (cupo ya liberado) | campaign=%s",
+                        callid, id_campaign,
+                    )
             else:
                 logger.warning(
                     "process_event [%s]: ChannelDestroyed ignorado (call_type=%s o campaña 0)",
@@ -4244,6 +5312,25 @@ class AverageWorker(DialerWorker):
                 callid, dialstatus,
             )
             return b'Event was processed'
+
+        # P0: AmdLatency embebido en Dial AMD (evita job Gearman extra desde ACD).
+        if dialstatus == 'AMD' and ari_event_data.get('amd_duration') is not None:
+            if int(id_campaign or 0) != 0:
+                try:
+                    amd_duration = float(ari_event_data.get('amd_duration'))
+                    if amd_duration < 0:
+                        amd_duration = 0.0
+                    cls._update_campaign_amd_latency(id_campaign, amd_duration)
+                    logger.info(
+                        "process_event [%s]: Dial AMD + amd_duration | "
+                        "campaign=%s amd_duration=%s",
+                        callid, id_campaign, amd_duration,
+                    )
+                except (TypeError, ValueError):
+                    logger.debug(
+                        "process_event [%s]: Dial AMD amd_duration inválido %r",
+                        callid, ari_event_data.get('amd_duration'),
+                    )
 
         # EXIT_ANSWERED: ATT de campaña; SIN_DISPOSICION si el contacto no calificó.
         if dialstatus == 'EXIT_ANSWERED':
@@ -4374,6 +5461,8 @@ class AverageWorker(DialerWorker):
             cls.handle_fail_event(ari_event_data, id_campaign, contact_id, phone_number)
             if fail_status in ABANDON_STATUSES:
                 cls.update_campaign_hit(id_campaign, hit=False, abandon=True)
+            elif fail_status in TECHNICAL_FAIL_STATUSES:
+                cls.update_campaign_hit(id_campaign, hit=False, tech=True)
             elif fail_status in FAIL_HIT_STATUSES:
                 cls.update_campaign_hit(id_campaign, hit=False, abandon=False)
             # Solo liberar cupo por pierna PSTN (no por Dial CANCEL/etc. de agente)
@@ -4422,12 +5511,40 @@ class AverageWorker(DialerWorker):
         return "NOANSWER"
 
     @classmethod
+    def _finalize_contact_nocontact(cls, id_campaign, contact_id, cursor=None):
+        """Marca final_status = FINALIZED_NOCONTACT en Postgres y Redis."""
+        if int(id_campaign or 0) == 0 or int(contact_id or 0) == 0:
+            return
+        if cursor is None:
+            with cls.get_dialer_connection() as conn_dialer:
+                cur = conn_dialer.cursor()
+                cur.execute(
+                    'UPDATE contact_in_campaign SET final_status = %s '
+                    'WHERE id_campaign = %s AND id_contact = %s;',
+                    (FINALIZED_NOCONTACT, id_campaign, contact_id),
+                )
+        else:
+            cursor.execute(
+                'UPDATE contact_in_campaign SET final_status = %s '
+                'WHERE id_campaign = %s AND id_contact = %s;',
+                (FINALIZED_NOCONTACT, id_campaign, contact_id),
+            )
+        cls.connect_redis_dialer()
+        cls.REDIS_DIALER_CONNECTION.hset(
+            f'CONTACT:{contact_id}:CAMP:{id_campaign}',
+            'STATUS',
+            FINALIZED_NOCONTACT,
+        )
+
+    @classmethod
     def handle_fail_event(cls, ari_event_data, id_campaign, contact_id, phone_number):
         event = cls.decode_fail_event(ari_event_data)
         logger.debug(f'Campaign {id_campaign}: receiving {event} for contact {contact_id}')
         cls.set_contact_status(id_campaign, contact_id, event)
         if event in FAIL_EVENTS and event not in FAIL_NO_RULES_EVENTS:
             cls.handle_incidence_rules(event, id_campaign, contact_id, phone_number)
+        else:
+            cls._finalize_contact_nocontact(id_campaign, contact_id)
 
     @classmethod
     def is_answer_event(cls, ari_event_data):
@@ -4616,16 +5733,20 @@ class AverageWorker(DialerWorker):
         id_campaign = data['id_campaign']
         sync_omnileads = data['sync_omnileads']
         logger.debug(f'Stopping campaign with id = {id_campaign}')
-        cls.reset_dialer_calls_counter(id_campaign, reason='stop_campaign')
+        # Cambiar estado a FINALIZED antes de limpiar cupo para cortar nuevos originates
         cls.set_campaign_status(id_campaign, FINALIZED, sync_omnileads=sync_omnileads)
+        cls.reset_dialer_calls_counter(
+            id_campaign, reason='stop_campaign', force=True,
+        )
         return b'Campaign was finalized'
 
     @classmethod
-    def update_prev_stats(cls, id_campaign):
+    def update_prev_stats(cls, id_campaign, stats=None):
         """Copy the current stats to the key 'COUNTER_PREV' so it can be used for comparison
         and send only the modified keys"""
-        for key, value in cls.REDIS_DIALER_CONNECTION.hgetall(
-                f'CAMP:{id_campaign}:COUNTER').items():
+        snapshot = stats if stats is not None else cls.REDIS_DIALER_CONNECTION.hgetall(
+            f'CAMP:{id_campaign}:COUNTER')
+        for key, value in snapshot.items():
             cls.REDIS_DIALER_CONNECTION.hset(f'CAMP:{id_campaign}:COUNTER_PREV', key, value)
 
     @classmethod
@@ -4699,7 +5820,7 @@ class AverageWorker(DialerWorker):
                 id_campaign, stats)})
             changed_stats_json = json.dumps(changed_stats)
             cls._notify_dialer_event(changed_stats_json)
-            cls.update_prev_stats(id_campaign)
+            cls.update_prev_stats(id_campaign, stats=stats)
             # for Postgres in Omnidialer
             stats_json = json.dumps(stats)
             cursor_dialer.execute(
@@ -4733,15 +5854,16 @@ class AverageWorker(DialerWorker):
             incidence_rule_applied = cls.apply_incidence_rule(
                 cursor_dialer, incidence_rule, id_contact, id_campaign, disposition_option,
                 DISPOSITION_TYPE, phone_number)
-            # if the incidence rule was applied and the campaign is paused, reactivate the campaign
-            if incidence_rule_applied:
-                status = cls.get_campaign_status(id_campaign, cursor_dialer)
-                if status == PAUSED:
-                    cls.set_campaign_status(id_campaign, ACTIVE, cursor=cursor_dialer,
-                                            sync_omnileads=True)
-                    message = json.dumps({'id_campaign': id_campaign})
-                    cls.GM_CLIENT.submit_job('process-campaign', message, background=True)
-            return b'Disposition for incidence rule was added!'
+            status = (
+                cls.get_campaign_status(id_campaign, cursor_dialer)
+                if incidence_rule_applied else None
+            )
+        # if the incidence rule was applied and the campaign is paused/finalized, reactivate after commit
+        if incidence_rule_applied and status in (PAUSED, FINALIZED):
+            cls.set_campaign_status(id_campaign, ACTIVE, sync_omnileads=True)
+            message = json.dumps({'id_campaign': id_campaign})
+            cls.GM_CLIENT.submit_job('process-campaign', message, background=True)
+        return b'Disposition for incidence rule was added!'
 
     @classmethod
     def _acquire_audit_lock(cls, ttl_sec=None):
@@ -4779,8 +5901,9 @@ class AverageWorker(DialerWorker):
         Reconcilia OML:CALLS:{camp}:DIALER con la suma de fotos ACD en Redis DB3.
 
         Histéresis asimétrica: subir tras AUDIT_UP_STREAK_TICKS (cota inferior OK
-        con cluster incompleto); bajar solo con cluster completo + streak más largo
-        y sin reserva reciente. No interpreta NODES vacío como cero.
+        con cluster incompleto). Bajar: cluster completo con AUDIT_DOWN_STREAK_TICKS,
+        o incompleto (fresh>0) con AUDIT_INCOMPLETE_DOWN_STREAK_TICKS. Nodos sin HB
+        se expulsan de OML:ACD:NODES tras ACD_STALE_EVICT_TICKS. NODES vacío ≠ cero.
         """
         logger.info("Iniciando auditoría de canales activos (Sanity Check)...")
 
@@ -4824,6 +5947,23 @@ class AverageWorker(DialerWorker):
 
                 if redis_count == observed:
                     cls._clear_audit_streak(camp_id, kind='calls')
+                    # CALLS ya alineado a 0: purgar phase keys huérfanas que
+                    # el match temprano nunca pasaba por _align_phases.
+                    if observed == 0 and campaign_active:
+                        try:
+                            _ph = list(cls.REDIS_DIALER_CONNECTION.scan_iter(
+                                match=f'OML:CALLS:PHASE:{camp_id}:*',
+                                count=50,
+                            ))
+                        except Exception:
+                            _ph = []
+                        if _ph:
+                            logger.warning(
+                                'Audit camp %s: CALLS=0 but %s orphan phase '
+                                'keys; purging',
+                                camp_id, len(_ph),
+                            )
+                            cls._align_phases_after_audit_down(camp_id, 0)
                 elif redis_count < observed:
                     # Undercount → over-dial risk; allow partial cluster as lower bound
                     n = cls._bump_audit_streak(
@@ -4845,39 +5985,54 @@ class AverageWorker(DialerWorker):
                     # redis_count > observed (ghost / overcount)
                     can_down = False
                     down_needed = AUDIT_DOWN_STREAK_TICKS
+                    safe_down_target = observed
+                    # Señal fresh: observed puede ser 0 con nodos vivos; incompleto
+                    # sin ningún nodo fresh ya retorna counts vacíos y se omite arriba
+                    # vía NODES vacío / no fresh. Aquí incompleto ⇒ hay fresh>0.
                     if not campaign_active and redis_count > 0:
                         if cluster_complete:
                             can_down = True
                             down_needed = AUDIT_IDLE_DOWN_STREAK_TICKS
                         else:
-                            cls._clear_audit_streak(camp_id, kind='calls')
-                            logger.debug(
-                                'Audit: skip idle camp %s down (incomplete cluster) '
-                                'redis=%s asterisk=%s',
-                                camp_id, redis_count, observed,
+                            # Cota inferior con streak más largo (nodo stale aún no
+                            # expulsado).
+                            can_down = True
+                            down_needed = max(
+                                AUDIT_IDLE_DOWN_STREAK_TICKS,
+                                int(AUDIT_INCOMPLETE_DOWN_STREAK_TICKS),
                             )
                     elif campaign_active:
-                        if not cluster_complete:
+                        recent_reserves = (
+                            cls._count_recent_reserves(camp_id)
+                            if cls._campaign_has_recent_reserve(camp_id)
+                            else 0
+                        )
+                        safe_down_target = observed + recent_reserves
+                        if redis_count <= safe_down_target:
                             cls._clear_audit_streak(camp_id, kind='calls')
                             logger.debug(
-                                'Audit: skip camp %s down (incomplete cluster) '
-                                'redis=%s asterisk=%s',
-                                camp_id, redis_count, observed,
+                                'Audit: skip camp %s (recent reserve=%s) '
+                                'redis=%s asterisk=%s safe=%s',
+                                camp_id, recent_reserves, redis_count,
+                                observed, safe_down_target,
                             )
-                        elif cls._campaign_has_recent_reserve(camp_id):
-                            cls._clear_audit_streak(camp_id, kind='calls')
-                            logger.debug(
-                                'Audit: skip camp %s (recent reserve) '
-                                'redis=%s asterisk=%s',
-                                camp_id, redis_count, observed,
-                            )
-                        else:
+                        elif cluster_complete:
                             can_down = True
                             down_needed = AUDIT_DOWN_STREAK_TICKS
+                        else:
+                            can_down = True
+                            down_needed = max(
+                                1, int(AUDIT_INCOMPLETE_DOWN_STREAK_TICKS),
+                            )
+                            logger.debug(
+                                'Audit: incomplete-cluster down camp %s '
+                                'redis=%s asterisk=%s need_streak=%s',
+                                camp_id, redis_count, observed, down_needed,
+                            )
 
                     if can_down:
                         n = cls._bump_audit_streak(
-                            camp_id, AUDIT_STREAK_DIR_DOWN, observed,
+                            camp_id, AUDIT_STREAK_DIR_DOWN, safe_down_target,
                             kind='calls',
                         )
                         if n >= down_needed:
@@ -4885,13 +6040,16 @@ class AverageWorker(DialerWorker):
                                 'Audit corrected camp %s: redis=%s asterisk=%s '
                                 'status=%s -> set %s (down streak=%s)',
                                 camp_id, redis_count, observed, dialer_status,
-                                observed, n,
+                                safe_down_target, n,
                             )
-                            cls.REDIS_DIALER_CONNECTION.set(key, observed)
+                            cls.REDIS_DIALER_CONNECTION.set(key, safe_down_target)
                             cls._publish_calls_count(camp_id)
                             corrections += 1
-                            redis_count = observed
+                            redis_count = safe_down_target
                             cls._clear_audit_streak(camp_id, kind='calls')
+                            cls._align_phases_after_audit_down(
+                                camp_id, safe_down_target,
+                            )
 
                 cls._reconcile_campaign_ringing_bucket(
                     camp_id,
@@ -5605,16 +6763,28 @@ class SchedulerWorker(AverageWorker):
             f'Campaign {id_campaign}: firing scheduled agenda for contact {id_contact}'
         )
         with cls.get_dialer_connection() as conn_dialer:
-            status_campaign = cls.get_campaign_status(id_campaign, conn_dialer.cursor())
-        if status_campaign != ACTIVE:
-            logger.info(
-                'Campaign %s: schedule_contact skipped (status=%s) contact=%s',
-                id_campaign, status_campaign, id_contact,
-            )
-            return 'Skipped: campaign not active'
+            cursor_dialer = conn_dialer.cursor()
+            status_campaign = cls.get_campaign_status(id_campaign, cursor_dialer)
+            if status_campaign != ACTIVE:
+                if id_contact:
+                    cursor_dialer.execute(
+                        'UPDATE contact_in_campaign SET schedule_aborted = true '
+                        'WHERE id_contact = %s AND id_campaign = %s;',
+                        (id_contact, id_campaign),
+                    )
+                logger.info(
+                    'Campaign %s: schedule_contact skipped (status=%s) contact=%s',
+                    id_campaign, status_campaign, id_contact,
+                )
+                return 'Skipped: campaign not active'
 
-        if not cls._reserve_dialer_channel(id_campaign, id_contact):
-            cls._mark_contact_status_created(id_campaign, id_contact)
+        reserve_reason = cls._reserve_dialer_channel(id_campaign, id_contact)
+        if reserve_reason != RESERVE_OK:
+            # Con phase viva no reencolar: la llamada ya está en curso.
+            if reserve_reason != RESERVE_PHASE_EXISTS:
+                cls._mark_contact_status_created(id_campaign, id_contact)
+            if reserve_reason == RESERVE_PHASE_EXISTS:
+                return 'Skipped: contact already in flight'
             return 'Skipped: no free dialer channels'
 
         success = cls.trigger_acd_dial(
@@ -5627,7 +6797,7 @@ class SchedulerWorker(AverageWorker):
 
         cls._decrement_calls_once(
             id_campaign, id_contact, None,
-            context='schedule_contact_gearman_rollback', use_dedup=False,
+            context='schedule_contact_gearman_rollback', use_dedup=True,
         )
         cls._mark_contact_status_created(id_campaign, id_contact)
         logger.warning(

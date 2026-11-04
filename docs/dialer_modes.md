@@ -20,17 +20,18 @@ con `resolve_dial_mode()` (orden de prioridad):
 |-----------|------|-----------|----------------|
 | 1 | `power` | `CAMP:{id}:CUSTOMDIALERDST != '0'` o `CAMP:{id}:VOICEBOT=true` en Redis | Llena hasta `max_channels` (todos los canales libres). Pensado para voicebots / destinos custom sin agentes |
 | 2 | `predictive` | `campaign.initial_predictive_model = true` (Postgres dialer) **y** `DIALER_PREDICTIVE_ENABLED=true` | Fórmula predictiva `C_dial` (ver §3) |
-| 3 | `progressive` | Resto de los casos (incluye flag de campaña en true pero kill-switch global en false) | `target = A_free × initial_boost_factor`; nuevas = `target − (RINGING + WAITING_AGENT)` (ONCALL no resta) |
+| 3 | `progressive` R=1 | Flag predictivo true pero `DIALER_PREDICTIVE_ENABLED=false` | Kill-switch global: `boost=1.0` (`reason=predictive_ff_disabled_r1`, label `PREDICTIVE_DISABLED_R1`) |
+| 4 | `progressive` | Resto (`initial_predictive_model=false`) | `target = A_free × initial_boost_factor`; nuevas = `target − (RINGING + WAITING_AGENT)` (ONCALL no resta) |
 
 Notas:
 
 - `initial_boost_factor` e `initial_predictive_model` se leen de la tabla
-  `campaign` de la base `omnidialer` con cache de 600 s
+  `campaign` de la base `omnidialer` con cache corto
   (`get_boost_factor` / `get_predictive_model`).
 - El progresivo con `initial_boost_factor = 1.0` es el "progresivo estricto"
   (R=1): una originación por agente READY **sin** contar canales ONCALL
   (esos ya están con agentes ocupados). Es el modo de seguridad al que cae
-  el predictivo en warm-up, sin muestra o con kill-switch latcheado.
+  el predictivo en warm-up, sin muestra, kill-switch latcheado, o FF global off.
 - El resultado del modo siempre queda limitado por el headroom de canales:
   `num_available_channels = max_channels − OML:CALLS:{id}:DIALER` (sí incluye
   ONCALL), y luego por la prorrateo de prioridad entre campañas
@@ -64,27 +65,44 @@ Cadencia cuando no hay contactos seleccionados en el ciclo:
 
 ### 3.1 Fórmula operativa
 
-En cada tick, `_allowed_parallel_predictive()` calcula:
+En cada tick, `_allowed_parallel_predictive()` llama a `compute_c_dial()`
+(`predictive_pacer.py`), que aplica **dos ramas** según `γ`
+(implementación real; no es un único producto al final):
 
 ```text
-C_dial = max(0, floor( (A_free + A_expected − C_ringing × P_hit) / P_hit × γ ))
+A_net = max(0, A_free + A_expected − C_waiting)   # WAITING_AGENT ya compromete READY
+
+# γ > 1  (boost / aggressiveness > 1): γ escala la capacidad de agentes
+C_dial = max(0, floor( (A_net × γ − C_ringing × P_hit) / P_hit ))
+
+# γ ≤ 1  (neutral o freno por drop): γ amortigua el cociente completo
+C_dial = max(0, floor( ((A_net − C_ringing × P_hit) / P_hit) × γ ))
 ```
 
-y luego aplica el cap de canales: `min(C_dial, max_channels − canales_activos)`.
+Luego aplica topes en orden:
 
-Interpretación: se dimensiona el déficit de agentes
-(`A_free + A_expected − connects esperados de lo que ya está sonando`) y se
-divide por `P_hit` para **sobre-marcar** compensando los intentos que no
-conectan con humano. `γ` modula la agresividad según el margen al abandono
-máximo permitido.
+1. `apply_dial_ratio_cap`: `C_dial ≤ floor(A_net × DIALER_MAX_DIAL_RATIO) − C_ringing`
+   (`0` desactiva el tope).
+2. Soft hold (`drop_over_dmax_soft`): reaplica el tope con ratio ≤ **1.0**.
+3. Cap de canales: `min(C_dial, max_channels − canales_activos)`
+   (`apply_channel_caps`).
+
+Interpretación: se dimensiona el déficit de agentes frente a connects
+esperados de lo que ya está sonando (`C_ringing × P_hit`) y se divide por
+`P_hit` para **sobre-marcar** compensando los intentos que no conectan con
+humano. `C_waiting` resta agentes ya comprometidos (misma semántica que
+progresivo). Con `γ > 1`, el boost multiplica `A_net` antes del ajuste de
+ringing. Con `γ ≤ 1`, el factor frena todo el cociente. `γ` sale de
+`compute_gamma()` según el margen al abandono máximo permitido.
 
 ### 3.2 Variables de entrada
 
 | Variable | Definición | Fuente |
 |----------|------------|--------|
-| `A_free` | Agentes en `READY`, ponderados multi-cola (`weight = 1/n_colas`); una fracción > 0 cuenta como 1 (semántica legacy) | `OML:AGENT:{id}` (Redis OML DB0): `STATUS`, `TIMESTAMP` |
+| `A_free` | Agentes en `READY`, ponderados multi-cola (`weight = 1/n_colas`); se excluyen si existe `acd:cooldown:agent:{id}`; el pacing usa `ceil(Σ weight)` (no perder fracciones multi-cola) | `OML:AGENT:{id}` (Redis OML DB0): `STATUS`, `TIMESTAMP` |
 | `A_expected` | Esperanza de agentes ocupados que se liberan durante el horizonte `t_ring`: `Σ P_lib,i × w_i` sobre `ONCALL` / `POSTCALL` / `PAUSE-ACW` | Snapshot de agentes + medias ATT/ACW/AHT |
-| `C_ringing` | Llamadas dialer en fase `RINGING` (originadas sin answer humano útil todavía) | `HGET CAMP:{id}:CHANNELS RINGING` (Redis dialer DB3) |
+| `C_waiting` | Fase `WAITING_AGENT` (humanos ya conectados esperando agente READY) | `HGET CAMP:{id}:CHANNELS WAITING_AGENT` |
+| `C_ringing` | Fase `RINGING` del hash, acotada a `max(0, CALLS − WAITING_AGENT − ONCALL)` para no contar fantasmas | `HGET CAMP:{id}:CHANNELS RINGING` + `OML:CALLS:{id}:DIALER` (Redis dialer DB3) |
 | `P_hit` | Probabilidad de connect humano (EWMA), con piso `HIT_RATE_FLOOR` | `CAMP:{id}:METRICS` → `P_HIT` |
 | `γ` (gamma) | Factor de corrección por margen al `D_max` | Calculado por `compute_gamma()` |
 | `aggressiveness` | Techo de γ en zona sana = `initial_boost_factor` de la campaña (clamp `[0.1, 5.0]`) | Postgres dialer `campaign.initial_boost_factor` |
@@ -133,10 +151,17 @@ Los eventos Dial que llegan vía Gearman `process-event` actualizan
 | Evento | Clasificación | Efecto en métricas |
 |--------|---------------|--------------------|
 | `ANSWERED_PSTN` | **Hit** (connect humano pre-agente) | `HIT_COUNT++`, `CONNECT_COUNT++`, `P_HIT ← EWMA(1)`, `DROP_RATE_EWMA ← EWMA(0)` |
-| `BUSY`, `NOANSWER`, `CONGESTION`, `TIMEOUT`, `TERMINATED`, `CHANUNAVAIL`, `INVALID_NUMBER`, `CANCEL`, `AMD`, `EXIT_SHORTCALL`, `ORIGINATE_FAILED`, `480_*`, `404_*` | **Fail** de contacto | `FAIL_COUNT++`, `P_HIT ← EWMA(0)`; **no** toca `DROP_RATE_EWMA` |
+| `BUSY`, `NOANSWER`, `TIMEOUT`, `TERMINATED`, `CANCEL`, `AMD`, `EXIT_SHORTCALL` | **Fail** de contacto | `FAIL_COUNT++`, `P_HIT ← EWMA(0)`; **no** toca `DROP_RATE_EWMA` |
+| `ORIGINATE_FAILED`, `CHANUNAVAIL`, `CONGESTION`, `INVALID_NUMBER`, `404_*`, `480_*` | **Fail técnico** (troncal) | `TECH_FAIL_COUNT++` solamente; **no** mueve `P_HIT` ni `FAIL_COUNT` |
 | `EXIT_ABANDON`, `EXIT_TIMEOUT` | **Abandon** (post-connect, sin agente) | `ABANDON_COUNT++`, `DROP_RATE_EWMA ← EWMA(1)`; **no** toca `P_HIT` ni `FAIL_COUNT` |
 | `AmdLatency` | Solo métrica H7 | Actualiza `AMD_LATENCY` + `METRICS.AMD_TIME`; sin status/DECR |
 | `ANSWERED_AGENT`, `EXIT_ANSWERED`, `EXIT_ACW`, `ChannelDestroyed`, … | Fuera de taxonomía hit/fail | No modifican METRICS de pacing |
+
+**AMD MACHINE (un job):** el ACD envía un solo `Dial`/`dialstatus=AMD` con
+`amd_duration` embebido (fail + DECR + H7). No encola `ChannelDestroyed` ni
+`AmdLatency` suelto para ese intento. Si un Destroy tardío llega igual, el
+dialer hace DECR dedup (marker contacto / callid) y **no** re-encola
+`send-reports`. Norte multi-ACD: [adr-dial-attempt-contract.md](adr-dial-attempt-contract.md).
 
 Ratios persistidos en el mismo hash:
 
@@ -184,15 +209,20 @@ DROP_RATE_EWMA = EWMA simétrico (α = DROP_RATE_ALPHA)  # fuente canónica para
 |------|-----------|--------|
 | `warmup` | `ATT_COUNT < DIALER_WARM_UP_SAMPLE_SIZE` | Progresivo R=1 (`target = A_free − RINGING − WAITING`) mientras se junta muestra |
 | `progressive_fallback` | Sin muestra de `P_hit` (`HIT+FAIL = 0`) | Progresivo R=1 |
-| soft hold | `D ≥ D_max` y streak `< K` (sin latch) | Predictive con `γ = GAMMA_THROTTLE_FLOOR` (`reason=drop_over_dmax_soft`) |
-| `throttled` | Latch activo (`streak ≥ K` o latched y `D ≥ 0.8×D_max`) | Progresivo R=1; `EVENT=THROTTLE_ENGAGED` al engarzar |
-| `predictive` | Resto | Fórmula completa `C_dial` con cap de canales |
+| soft hold | EWMA `D ≥ D_max` y sin latch | Predictive con `γ = GAMMA_THROTTLE_FLOOR` y ratio ≤ **1×** `A_net` |
+| `throttled` | Latch activo | Progresivo R=1; `EVENT=THROTTLE_ENGAGED` al engarzar |
+| `predictive` | Resto | Fórmula completa `C_dial` + `MAX_DIAL_RATIO` + cap de canales |
 
-Kill-switch (P3): `CAMP:{id}:THROTTLE_STREAK` se incrementa cada tick con
-`D ≥ D_max`; al llegar a `DIALER_THROTTLE_STREAK_K` (default 5) se setea
-`CAMP:{id}:THROTTLE_LATCH` + `WARNING` + evento en `CAMP:{id}:PACING`.
-Salida con histéresis solo cuando `D < DIALER_THROTTLE_EXIT_RATIO × D_max`
-(default 0.8) → `EVENT=THROTTLE_CLEARED`.
+Kill-switch (I3): wall-clock. `CAMP:{id}:THROTTLE_OVER_SINCE` marca el primer
+tick con `D_throttle ≥ D_max`. Tras `DIALER_THROTTLE_STREAK_SEC` segundos se
+setea `THROTTLE_LATCH`. `D_throttle = max(DROP_RATE_EWMA, DROP_RATE acumulado)`
+solo si `HIT_COUNT ≥ DIALER_THROTTLE_MIN_HITS` (si no, no se engarza; γ sigue
+con EWMA). Salida con histéresis cuando `D_throttle < EXIT_RATIO × D_max` →
+`THROTTLE_CLEARED` (`WARNING`).
+
+Fail-closed: error Redis → `force_throttle=True`. `drop_rate=None` no limpia
+latch. Al `start_campaign`: `DEL` `METRICS`, `ATT`, `THROTTLE_OVER_SINCE`,
+`THROTTLE_LATCH`, `PACING` (y legacy `THROTTLE_STREAK`). Conserva ART/ACW/AHT/AMD.
 
 El warm-up / throttled reutiliza `_allowed_parallel_progressive`:
 `calls_to_dial = ceil(A_free × boost) − (RINGING + WAITING_AGENT)`. ONCALL
@@ -205,13 +235,20 @@ El warm-up se mide sobre `ATT_COUNT` del hash `CAMP:{id}:ATT` (llamadas con
 
 ### 3.8 Caps duros (siempre activos)
 
-1. `max_channels` de la campaña: `C_dial ≤ max_channels − canales_activos`
+1. `DIALER_MAX_DIAL_RATIO` (código `5`, deploy `3`): `C_dial ≤ floor(A_net × ratio) − C_ringing`
+   (`apply_dial_ratio_cap`; `0` = desactivado). Soft hold fuerza ratio ≤ 1.
+   Lab vs prod: con `P_hit` bajo (AMD/lab) la fórmula pide mucho y el **ratio
+   es el freno**; con hit real alto la fórmula ya disca menos, pero los
+   abandons aparecen (connects humanos, `A_expected`, multi-campaña). Partir
+   en `3` y subir a `4`–`5` solo si la espera READY crece y `DROP`/`ABAND`
+   siguen bajo `D_max`. No validar solo con `ABAND=0` del emulador.
+2. `max_channels` de la campaña: `C_dial ≤ max_channels − canales_activos`
    (`apply_channel_caps`).
-2. Reserva atómica por contacto (`_RESERVE_CHANNEL_LUA`): si no hay cupo, el
+3. Reserva atómica por contacto (`_RESERVE_CHANNEL_LUA`): si no hay cupo, el
    contacto vuelve a `STATUS_CREATED`.
-3. `DIALER_CAPS`: máximo de originaciones por segundo dentro del loop.
-4. Prorrateo por prioridad entre campañas (`allowed_calls_prority_percentage`).
-5. Sin agentes READY ni esperados, `C_dial` tiende a 0 por la propia fórmula
+4. `DIALER_CAPS`: máximo de originaciones por segundo dentro del loop.
+5. Prorrateo por prioridad entre campañas (`allowed_calls_prority_percentage`).
+6. Sin agentes READY ni esperados (y sin `A_expected` neta), `C_dial` tiende a 0
    (en progresivo, `A_free = 0` ⇒ no disca).
 
 ---
@@ -220,12 +257,14 @@ El warm-up se mide sobre `ATT_COUNT` del hash `CAMP:{id}:ATT` (llamadas con
 
 ### 4.1 Variables de entorno (globales, por despliegue)
 
-Definidas en `workers/handle-campaign/src/settings/default.py`. Valores de
-ejemplo tomados de `docker-compose/test-env/.env`:
+Definidas en `workers/handle-campaign/src/settings/default.py` (defaults de
+**código** / unit tests). El deploy prod (`ansible/group_vars/all/tenants_global.yml`,
+`docker-compose/env`) usa otro set más suave (p.ej. `D_max=0.08`, `α=0.05`,
+`K=45`, `HIT_RATE_FLOOR=0.02`, `GAMMA_THROTTLE_FLOOR=0.4`, `MAX_DIAL_RATIO=3`).
 
-| Env var | Setting | Default | Qué controla |
-|---------|---------|---------|--------------|
-| `DIALER_PREDICTIVE_ENABLED` | `PREDICTIVE_ENABLED` | `true` | Kill-switch global. En `false`, toda campaña con `initial_predictive_model=true` cae a progresivo (con boost) |
+| Env var | Setting | Default código | Qué controla |
+|---------|---------|----------------|--------------|
+| `DIALER_PREDICTIVE_ENABLED` | `PREDICTIVE_ENABLED` | `true` | Kill-switch global. En `false`, campaña predictiva cae a progresivo **R=1** (ignora boost) |
 | `DIALER_MAX_ABANDON_RATE` | `MAX_ABANDON_RATE` | `0.03` | `D_max`: techo de abandono reciente (`DROP_RATE_EWMA`). Gobierna las zonas de γ y el modo throttled |
 | `DIALER_WARM_UP_SAMPLE_SIZE` | `WARM_UP_SAMPLE_SIZE` | `50` | Cantidad de llamadas atendidas (`ATT_COUNT`) en progresivo estricto antes de habilitar el modo predictivo |
 | `DIALER_PREDICTIVE_TICK_MS` | `PREDICTIVE_TICK_MS` | `1000` | Cadencia (ms) del ciclo de evaluación cuando una campaña predictiva no tiene contactos para discar en el ciclo. `0` desactiva el tick rápido y usa `DIALER_TIME_BETWEEN_CALLS` |
@@ -236,9 +275,12 @@ ejemplo tomados de `docker-compose/test-env/.env`:
 | `DIALER_AMD_CONF_CACHE_TTL_SEC` | `AMD_CONF_CACHE_TTL_SEC` | `60` | TTL cache lectura `OML:AMD_CONF` / `OML:CAMP.AMD` |
 | `DIALER_P_LIB_REMAINING_EPS` | `P_LIB_REMAINING_EPS` | `1.0` | Piso (segundos) del tiempo residual de ocupación en `P_lib`; evita `remaining ≤ 0` |
 | `DIALER_GAMMA_THROTTLE_FLOOR` | `GAMMA_THROTTLE_FLOOR` | `0.2` | Valor al que interpola γ en el borde `D → D_max` (piso soft / soft-hold) |
+| `DIALER_MAX_DIAL_RATIO` | `MAX_DIAL_RATIO` | `5` (deploy `3`) | Tope duro: `C_dial ≤ A_net × ratio − ringing`. `0` desactiva. Ver §3.8 lab vs prod |
 | `DIALER_PACING_SNAPSHOT_TTL_SEC` | `PACING_SNAPSHOT_TTL_SEC` | `30` | TTL de `CAMP:{id}:PACING` (último snapshot de decisión predictiva) |
-| `DIALER_THROTTLE_STREAK_K` | `THROTTLE_STREAK_K` | `5` | Ticks consecutivos con `D ≥ D_max` antes de latchear el kill-switch |
-| `DIALER_THROTTLE_EXIT_RATIO` | `THROTTLE_EXIT_RATIO` | `0.8` | Histéresis: salir del latch solo si `D < ratio × D_max` |
+| `DIALER_THROTTLE_STREAK_SEC` | `THROTTLE_STREAK_SEC` | `5` (fallback K) | Segundos wall-clock con `D_throttle ≥ D_max` antes del latch |
+| `DIALER_THROTTLE_STREAK_K` | `THROTTLE_STREAK_K` | `5` | Legacy: usado solo si `STREAK_SEC` no está definido |
+| `DIALER_THROTTLE_MIN_HITS` | `THROTTLE_MIN_HITS` | `20` | `HIT_COUNT` mínimo antes de poder engarzar el latch |
+| `DIALER_THROTTLE_EXIT_RATIO` | `THROTTLE_EXIT_RATIO` | `0.8` | Histéresis: salir del latch solo si `D_throttle < ratio × D_max` |
 
 Constante relacionada **no configurable por env** (hardcodeada en
 `naive.py`): `P_HIT_ALPHA = 0.1` (α del EWMA de `P_HIT`). La latencia AMD
@@ -280,8 +322,8 @@ reflejarse en el pacing salvo reinicio del worker.
 | `CAMP:{id}:AHT` | HASH | `AHT` (derivado; fallback `ATT + ACW`) |
 | `CAMP:{id}:ART` | HASH | `ART_SUM`, `ART_COUNT`, `ART` |
 | `CAMP:{id}:CHANNELS` | HASH | `RINGING`, `WAITING_AGENT`, `ONCALL` (fases de canal dialer) |
-| `CAMP:{id}:PACING` | HASH | Snapshot del último tick predictivo (`MODE`, `REASON`, `GAMMA`, `C_DIAL`, `P_HIT`, `DROP_RATE`, `A_FREE`, `A_EXPECTED`, `C_RINGING`, `THROTTLE_STREAK`, `THROTTLE_LATCHED`, `EVENT`, `TS`); TTL `DIALER_PACING_SNAPSHOT_TTL_SEC` |
-| `CAMP:{id}:THROTTLE_STREAK` | STRING | Contador de ticks consecutivos con `D ≥ D_max` |
+| `CAMP:{id}:PACING` | HASH | Snapshot (`MODE`, `REASON`, `GAMMA`, `C_DIAL`, `P_HIT`, `DROP_RATE`, `DROP_RATE_CUM`, `HIT_COUNT`, `D_THROTTLE`, `A_FREE`, `A_EXPECTED`, `C_RINGING`, `C_WAITING`, `MAX_DIAL_RATIO`, `THROTTLE_STREAK`/`THROTTLE_OVER_SEC`, `THROTTLE_LATCHED`, `EVENT`, `TS`) |
+| `CAMP:{id}:THROTTLE_OVER_SINCE` | STRING | Epoch float del inicio de `D_throttle ≥ D_max` |
 | `CAMP:{id}:THROTTLE_LATCH` | STRING | `1` si el kill-switch está latcheado |
 | `OML:CALLS:{id}:DIALER` | STRING | Total de canales/reservas en vuelo (invariante: = suma de fases) |
 | `OML:CALLS:PHASE:{camp}:{contact}[:{callid}]` | STRING | Fase por contacto (TTL `DIALER_CALLS_PHASE_TTL_SEC`) |
@@ -322,6 +364,7 @@ Cada tick de `_allowed_parallel_predictive` (incluidos warm-up / throttled /
 fallback) escribe `CAMP:{id}:PACING` en Redis DB3 con TTL corto
 (`DIALER_PACING_SNAPSHOT_TTL_SEC`, default 30s). Campos: `MODE`, `REASON`,
 `GAMMA`, `C_DIAL`, `P_HIT`, `DROP_RATE` (fuente de γ), `A_FREE`, `A_EXPECTED`,
+`C_WAITING`, `MAX_DIAL_RATIO`,
 `C_RINGING`, `THROTTLE_STREAK`, `THROTTLE_LATCHED`, `EVENT`
 (`THROTTLE_ENGAGED` / `THROTTLE_CLEARED` solo en transiciones), `TS`. Lectura
 tipada desde Django: `OmnidialerService.obtener_pacing_campana` (UI de detalle
@@ -360,7 +403,7 @@ redis-cli -n 3 HGETALL CAMP:5:ART
 | Tema | Path |
 |------|------|
 | Loop y dispatch de modos | `workers/handle-campaign/src/handler/naive.py` → `process_campaign_inside`, `allowed_parallel_contact_attempts`, `resolve_dial_mode` |
-| Pacing predictivo | `naive.py` → `_allowed_parallel_predictive`; helpers puros en `workers/handle-campaign/src/handler/predictive_pacer.py` (`compute_gamma`, `compute_c_dial`, `decide_predictive_pace`, `apply_channel_caps`) |
+| Pacing predictivo | `naive.py` → `_allowed_parallel_predictive`; helpers puros en `workers/handle-campaign/src/handler/predictive_pacer.py` (`compute_gamma`, `compute_c_dial`, `apply_dial_ratio_cap`, `decide_predictive_pace`, `apply_channel_caps`) |
 | `A_expected` / `P_lib` / `t_ring` | `naive.py` → `get_campaign_agent_snapshot`, `compute_a_expected`, `get_campaign_a_expected`, `get_campaign_t_ring`, `compute_agent_p_lib` |
 | Métricas Hit/Fail/Abandon | `naive.py` → `_UPDATE_CAMPAIGN_HIT_LUA`, `update_campaign_hit`, `process_event` |
 | Settings y defaults | `workers/handle-campaign/src/settings/default.py` |
