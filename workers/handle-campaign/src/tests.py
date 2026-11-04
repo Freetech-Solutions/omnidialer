@@ -60,6 +60,8 @@ class PredictiveConstantsTests(unittest.TestCase):
         self.assertEqual(dialer_settings.THROTTLE_EXIT_RATIO, 0.8)
         self.assertEqual(dialer_settings.THROTTLE_STATE_TTL_SEC, 300)
         self.assertEqual(dialer_settings.CAPS_REVALIDATE_EVERY, 3)
+        self.assertTrue(dialer_settings.ATTEMPT_ID_ENABLED)
+        self.assertEqual(naive_mod.ATTEMPT_ID_ENABLED, dialer_settings.ATTEMPT_ID_ENABLED)
         self.assertEqual(naive_mod.MAX_ABANDON_RATE, dialer_settings.MAX_ABANDON_RATE)
         self.assertEqual(naive_mod.WARM_UP_SAMPLE_SIZE, dialer_settings.WARM_UP_SAMPLE_SIZE)
         self.assertEqual(naive_mod.PREDICTIVE_TICK_MS, dialer_settings.PREDICTIVE_TICK_MS)
@@ -585,7 +587,15 @@ class PredictiveStatsHtmxTests(unittest.TestCase):
             predictive=AverageWorker.collect_predictive_stats(cid))
         self.assertIn('ATTEMPTED_CALLS', html)
         self.assertIn(f'/htmx/pacing/{cid}', html)
-        self.assertIn('every 5s', html)
+        self.assertIn(f'/htmx/stats/inner/{cid}', html)
+        self.assertEqual(html.count('every 5s'), 2)
+
+    def test_render_stats_inner_html_lists_counters(self):
+        from ui.rendering import AdminRender
+        html = AdminRender.render_stats_inner(
+            self.campaign_id, {'ATTEMPTED_CALLS': '7'})
+        self.assertIn('ATTEMPTED_CALLS', html)
+        self.assertIn('list-group', html)
 
 
 class CampaignThrottleFailClosedUnitTests(unittest.TestCase):
@@ -3675,11 +3685,14 @@ class MyTestSuite(unittest.TestCase):
             result = SchedulerWorker.schedule_contact('6093017590', 4, 1)
 
             self.assertEqual(result, 'GD!!!')
-            SchedulerWorker.trigger_acd_dial.assert_called_once_with(
-                phone_number='6093017590',
-                campaign_id=4,
-                contact_id=1,
-            )
+            SchedulerWorker.trigger_acd_dial.assert_called_once()
+            call_kw = SchedulerWorker.trigger_acd_dial.call_args.kwargs
+            self.assertEqual(call_kw.get('phone_number'), '6093017590')
+            self.assertEqual(call_kw.get('campaign_id'), 4)
+            self.assertEqual(call_kw.get('contact_id'), 1)
+            attrs = call_kw.get('attributes') or {}
+            self.assertIn('attempt_id', attrs)
+            self.assertTrue(attrs['attempt_id'])
             val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
             self.assertEqual(int(val), 2)
             phases = AverageWorker.get_campaign_channel_phases(4)
@@ -3850,6 +3863,55 @@ class MyTestSuite(unittest.TestCase):
         self.assertEqual(phases[PHASE_ONCALL], 0)
         phase = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:PHASE:4:1')
         self.assertEqual(phase, PHASE_RINGING)
+
+    def test_reserve_stores_attempt_id_when_enabled(self):
+        import settings.default as dialer_settings
+        from handler.dial_attempt import attempt_redis_key, get_attempt_id
+        self.assertTrue(dialer_settings.ATTEMPT_ID_ENABLED)
+        self._set_campaign_active(4, max_channels=5)
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 0)
+        AverageWorker._init_campaign_channel_phases(4)
+        self.assertEqual(AverageWorker._reserve_dialer_channel(4, 1), RESERVE_OK)
+        aid = get_attempt_id(AverageWorker.REDIS_DIALER_CONNECTION, 4, 1)
+        self.assertIsNotNone(aid)
+        self.assertTrue(len(aid) >= 32)
+        raw = AverageWorker.REDIS_DIALER_CONNECTION.get(attempt_redis_key(4, 1))
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8')
+        self.assertEqual(raw, aid)
+
+    def test_trigger_acd_dial_includes_attempt_id_in_metadata(self):
+        captured = {}
+
+        class _FakeClient:
+            def submit_job(self, job_name, message, background=True):
+                captured['job'] = job_name
+                captured['payload'] = json.loads(message)
+
+        AverageWorker.GM_CLIENT = _FakeClient()
+        ok = AverageWorker.trigger_acd_dial(
+            '6093017590', 4, 1, attributes={'attempt_id': 'att-test-1'},
+        )
+        self.assertTrue(ok)
+        self.assertEqual(captured['job'], 'acd-call-processor')
+        self.assertEqual(captured['payload']['metadata']['attempt_id'], 'att-test-1')
+
+    def test_reserve_skips_attempt_id_when_flag_off(self):
+        import handler.naive as naive_mod
+        self._set_campaign_active(4, max_channels=5)
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 0)
+        AverageWorker._init_campaign_channel_phases(4)
+        original = naive_mod.ATTEMPT_ID_ENABLED
+        naive_mod.ATTEMPT_ID_ENABLED = False
+        try:
+            self.assertEqual(AverageWorker._reserve_dialer_channel(4, 2), RESERVE_OK)
+            self.assertIsNone(
+                AverageWorker.REDIS_DIALER_CONNECTION.get('OML:ATTEMPT:4:2'),
+            )
+        finally:
+            naive_mod.ATTEMPT_ID_ENABLED = original
 
     def test_reserve_at_max_does_not_leave_orphan_phase(self):
         self._set_campaign_active(4, max_channels=1)

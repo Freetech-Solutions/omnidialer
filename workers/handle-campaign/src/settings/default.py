@@ -104,3 +104,8 @@ GUARDRAIL_GEARMAN_STATUS_TTL_SEC = float(
 # Fail worker boot if Redis/Gearman endpoints unreachable
 _raw_require_ep = os.getenv('DIALER_REQUIRE_ENDPOINTS', 'false').strip().lower()
 REQUIRE_ENDPOINTS = _raw_require_ep in ('1', 'true', 'yes', 'on')
+
+# M0: generate/propagate attempt_id on reserve → Gearman dial metadata.
+# Does NOT change OML:CALLS / DECR semantics (still contact/callid).
+_raw_attempt_id = os.getenv('DIALER_ATTEMPT_ID_ENABLED', 'true').strip().lower()
+ATTEMPT_ID_ENABLED = _raw_attempt_id in ('1', 'true', 'yes', 'on')

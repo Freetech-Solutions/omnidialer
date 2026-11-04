@@ -4,3 +4,4 @@ requests
 psycopg[binary,pool]
 Jinja2==3.0.0
 apscheduler
+prometheus-client>=0.19.0
