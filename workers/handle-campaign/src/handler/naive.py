@@ -352,9 +352,16 @@ FAIL_EVENTS = [
 
 # fail statuses with no incidence rules
 FAIL_NO_RULES_EVENTS = [
-    'CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'AMD', 'EXIT_SHORTCALL',
-    'ORIGINATE_FAILED', '404_NOT_FOUND', 'EXIT_ABANDON', 'EXIT_TIMEOUT',
+    'CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'EXIT_SHORTCALL',
+    'ORIGINATE_FAILED', '404_NOT_FOUND', 'EXIT_ABANDON',
 ]
+
+# Dial status → incidence_rules.status lookup (UI labels).
+# History/metrics keep the original event; only rule lookup is aliased.
+INCIDENCE_RULE_EVENT_MAP = {
+    'AMD': 'TERMINATED',          # UI Contestador
+    'EXIT_TIMEOUT': 'TIMEOUT',    # UI Timeout = timeout de cola post-connect
+}
 
 # P_hit / Drop — taxonomía canónica (H3)
 #
@@ -5215,13 +5222,16 @@ class AverageWorker(DialerWorker):
         #   if the contact's history and the incidence rule indicates that the
         #   contact must be called again, schedule a call according to the incidence rule
         cls.connect_redis_dialer()
-        status_code = NAME_TO_STATUS[status]
+        # Count attempts with the real dial status (AMD stays AMD in HISTORY).
+        history_status_code = NAME_TO_STATUS[status]
+        # Rule lookup may alias (AMD → TERMINATED / Contestador in OML UI).
+        rule_status = INCIDENCE_RULE_EVENT_MAP.get(status, status)
         with cls.get_dialer_connection() as conn_dialer:
             cursor_dialer = conn_dialer.cursor()
-            incidence_rule = cls.get_incidence_rule(id_campaign, status)
+            incidence_rule = cls.get_incidence_rule(id_campaign, rule_status)
             cls.apply_incidence_rule(
-                cursor_dialer, incidence_rule, contact_id, id_campaign, status_code,
-                PHONE_TYPE, phone_number)
+                cursor_dialer, incidence_rule, contact_id, id_campaign,
+                history_status_code, PHONE_TYPE, phone_number)
 
     @classmethod
     @job_handler_decorator

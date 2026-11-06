@@ -18,7 +18,7 @@ from handler.naive import (
     AverageWorker, SchedulerWorker, ACTIVE, PAUSED, CREATED, FINALIZED,
     STATUS_SELECTED_CALL, STATUS_CREATED, STATUS_ANSWERED_AGENT,
     FINALIZED_NOCONTACT, PENDING_ATTEMPTS, STATUS_AMD_MACHINE,
-    STATUS_TERMINATED, STATUS_EXIT_ABANDON, STATUS_EXIT_TIMEOUT,
+    STATUS_TERMINATED, STATUS_TIMEOUT, STATUS_EXIT_ABANDON, STATUS_EXIT_TIMEOUT,
     AUDIT_LOCK_KEY, AUDIT_ACTIVE_CHANNELS_JOB,
     PHASE_RINGING, PHASE_WAITING_AGENT, PHASE_ONCALL,
     SCHEDULER_LEADER_KEY,
@@ -2015,9 +2015,13 @@ class MyTestSuite(unittest.TestCase):
     def setUp(self):
         self._wait_pg()
         self.fetchmany_counter = 0
+        AverageWorker.get_incidence_rule.cache_clear()
+        AverageWorker.get_incidence_rule_disposition.cache_clear()
         self._create_campaign()
 
     def tearDown(self):
+        AverageWorker.get_incidence_rule.cache_clear()
+        AverageWorker.get_incidence_rule_disposition.cache_clear()
         self.clean_databases()
 
     @classmethod
@@ -2202,6 +2206,76 @@ class MyTestSuite(unittest.TestCase):
         # check that a job was submitted to 'schedule-contact'
         self.assertEqual(AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][0],
                          'schedule-agenda')
+
+    def test_amd_uses_contestador_terminated_incidence_rule(self):
+        """Dial AMD looks up UI Contestador rule (TERMINATED) and schedules retry."""
+        AverageWorker.GM_CLIENT.submit_job = MagicMock()
+        AverageWorker.get_incidence_rule.cache_clear()
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn_dialer:
+            cursor_dialer = conn_dialer.cursor()
+            cursor_dialer.execute(
+                """INSERT INTO incidence_rules (id, status, status_custom, max_attempt,
+                retry_later, in_mode, campaign_id) VALUES
+                (%s, %s, %s, %s, %s, %s, %s);""",
+                (30, STATUS_TERMINATED, 'CONTESTADOR', 1, 60, 1, 4))
+        amd_event = self.gen_fail_event('AMD')
+        amd_event['callid'] = 'amd-incidence-1'
+        job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(amd_event), encoding='UTF8'),
+        )
+        AverageWorker.process_event(self.worker, job)
+        self.assertEqual(
+            AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][0],
+            'schedule-agenda',
+        )
+        agenda = json.loads(AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][1])
+        self.assertEqual(agenda['type'], 'incidence_rule')
+        self.assertEqual(str(agenda['id_campaign']), '4')
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn_dialer:
+            cursor_dialer = conn_dialer.cursor()
+            cursor_dialer.execute(
+                'SELECT final_status, status FROM contact_in_campaign '
+                'WHERE id_campaign = 4 AND id_contact = 1',
+            )
+            final_status, contact_status = cursor_dialer.fetchone()
+            self.assertEqual(final_status, PENDING_ATTEMPTS)
+            self.assertEqual(contact_status, STATUS_AMD_MACHINE)
+
+    def test_exit_timeout_uses_timeout_incidence_rule(self):
+        """Dial EXIT_TIMEOUT looks up UI Timeout rule and schedules retry."""
+        AverageWorker.GM_CLIENT.submit_job = MagicMock()
+        AverageWorker.get_incidence_rule.cache_clear()
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn_dialer:
+            cursor_dialer = conn_dialer.cursor()
+            cursor_dialer.execute(
+                """INSERT INTO incidence_rules (id, status, status_custom, max_attempt,
+                retry_later, in_mode, campaign_id) VALUES
+                (%s, %s, %s, %s, %s, %s, %s);""",
+                (31, STATUS_TIMEOUT, '', 1, 60, 1, 4))
+        event = self.gen_fail_event('EXIT_TIMEOUT')
+        event['callid'] = 'exit-timeout-incidence-1'
+        job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(event), encoding='UTF8'),
+        )
+        AverageWorker.process_event(self.worker, job)
+        self.assertEqual(
+            AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][0],
+            'schedule-agenda',
+        )
+        agenda = json.loads(AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][1])
+        self.assertEqual(agenda['type'], 'incidence_rule')
+        self.assertEqual(str(agenda['id_campaign']), '4')
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn_dialer:
+            cursor_dialer = conn_dialer.cursor()
+            cursor_dialer.execute(
+                'SELECT final_status, status FROM contact_in_campaign '
+                'WHERE id_campaign = 4 AND id_contact = 1',
+            )
+            final_status, contact_status = cursor_dialer.fetchone()
+            self.assertEqual(final_status, PENDING_ATTEMPTS)
+            self.assertEqual(contact_status, STATUS_EXIT_TIMEOUT)
 
     def test_process_event_missing_explicit_fields_fails_fast(self):
         AverageWorker.GM_CLIENT.submit_job = MagicMock()
@@ -3288,7 +3362,9 @@ class MyTestSuite(unittest.TestCase):
                     ' AND id_contact = 1;'
                 )
                 self.assertEqual(cursor_dialer.fetchone()[0], STATUS_EXIT_TIMEOUT)
-            AverageWorker.handle_incidence_rules.assert_not_called()
+            AverageWorker.handle_incidence_rules.assert_called_once_with(
+                'EXIT_TIMEOUT', '4', '1', '6093017590',
+            )
         finally:
             AverageWorker.handle_incidence_rules = original_incidence
 
@@ -4729,7 +4805,10 @@ class StabilizationFixesUnitTests(unittest.TestCase):
         AverageWorker.handle_incidence_rules = MagicMock()
         AverageWorker._finalize_contact_nocontact = MagicMock()
         try:
-            for dialstatus in ('EXIT_ABANDON', 'EXIT_TIMEOUT', 'CHANUNAVAIL', 'AMD', 'ORIGINATE_FAILED'):
+            for dialstatus in (
+                'EXIT_ABANDON', 'CHANUNAVAIL', 'ORIGINATE_FAILED',
+            ):
+                AverageWorker.handle_incidence_rules.reset_mock()
                 AverageWorker._finalize_contact_nocontact.reset_mock()
                 AverageWorker.handle_fail_event(
                     {'dialstatus': dialstatus, 'type': 'Dial'},
@@ -4737,6 +4816,56 @@ class StabilizationFixesUnitTests(unittest.TestCase):
                 )
                 AverageWorker.handle_incidence_rules.assert_not_called()
                 AverageWorker._finalize_contact_nocontact.assert_called_once_with(4, 10)
+        finally:
+            AverageWorker.set_contact_status = orig_set_status
+            AverageWorker.handle_incidence_rules = orig_incidence
+            AverageWorker._finalize_contact_nocontact = orig_finalize
+
+    def test_amd_fail_event_uses_incidence_rules_not_finalize(self):
+        """AMD applies Contestador incidence path (not FAIL_NO_RULES finalize)."""
+        orig_set_status = AverageWorker.set_contact_status
+        orig_incidence = AverageWorker.handle_incidence_rules
+        orig_finalize = AverageWorker._finalize_contact_nocontact
+        AverageWorker.set_contact_status = MagicMock()
+        AverageWorker.handle_incidence_rules = MagicMock()
+        AverageWorker._finalize_contact_nocontact = MagicMock()
+        try:
+            AverageWorker.handle_fail_event(
+                {'dialstatus': 'AMD', 'type': 'Dial'},
+                id_campaign=4, contact_id=10, phone_number='6093017590',
+            )
+            AverageWorker.set_contact_status.assert_called_once_with(
+                4, 10, 'AMD',
+            )
+            AverageWorker.handle_incidence_rules.assert_called_once_with(
+                'AMD', 4, 10, '6093017590',
+            )
+            AverageWorker._finalize_contact_nocontact.assert_not_called()
+        finally:
+            AverageWorker.set_contact_status = orig_set_status
+            AverageWorker.handle_incidence_rules = orig_incidence
+            AverageWorker._finalize_contact_nocontact = orig_finalize
+
+    def test_exit_timeout_fail_event_uses_incidence_rules_not_finalize(self):
+        """EXIT_TIMEOUT applies UI Timeout incidence path (not FAIL_NO_RULES)."""
+        orig_set_status = AverageWorker.set_contact_status
+        orig_incidence = AverageWorker.handle_incidence_rules
+        orig_finalize = AverageWorker._finalize_contact_nocontact
+        AverageWorker.set_contact_status = MagicMock()
+        AverageWorker.handle_incidence_rules = MagicMock()
+        AverageWorker._finalize_contact_nocontact = MagicMock()
+        try:
+            AverageWorker.handle_fail_event(
+                {'dialstatus': 'EXIT_TIMEOUT', 'type': 'Dial'},
+                id_campaign=4, contact_id=10, phone_number='6093017590',
+            )
+            AverageWorker.set_contact_status.assert_called_once_with(
+                4, 10, 'EXIT_TIMEOUT',
+            )
+            AverageWorker.handle_incidence_rules.assert_called_once_with(
+                'EXIT_TIMEOUT', 4, 10, '6093017590',
+            )
+            AverageWorker._finalize_contact_nocontact.assert_not_called()
         finally:
             AverageWorker.set_contact_status = orig_set_status
             AverageWorker.handle_incidence_rules = orig_incidence
