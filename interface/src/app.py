@@ -180,6 +180,14 @@ def stats(id_campaign):
     )
 
 
+@app.route('/htmx/stats/inner/<id_campaign>')
+def stats_inner(id_campaign):
+    """Renders the campaign counters block (auto-refresh poll from the stats modal)"""
+    return DIALER.render_template(
+        {'type': 'stats_inner', 'id_campaign': id_campaign}
+    )
+
+
 @app.route('/htmx/pacing/<id_campaign>')
 def pacing_stats(id_campaign):
     """Renders the predictive pacing metrics of a campaign (poll from the stats modal)"""

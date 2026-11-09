@@ -4,12 +4,11 @@
         <div class="modal-header">
             <h5 class="modal-title">Statistics for campaign {{id_campaign}}</h5>
         </div>
-        <div class="modal-body">
-            <ul class="list-group">
-                {% for key, value in statistics.items() %}
-                    <li class="list-group-item">{{ key }}: {{ value }}</li>
-                {% endfor %}
-            </ul>
+        <div class="p-3" id="counter-stats"
+             hx-get="/htmx/stats/inner/{{ id_campaign }}"
+             hx-trigger="every 5s"
+             hx-swap="innerHTML">
+            {% include 'htmx/statistics_inner.html' %}
         </div>
         <div class="px-3 pb-3 border-top" id="pacing-stats"
              hx-get="/htmx/pacing/{{ id_campaign }}"

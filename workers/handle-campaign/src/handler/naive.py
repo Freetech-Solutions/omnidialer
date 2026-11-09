@@ -68,6 +68,12 @@ from settings.default import (
     THROTTLE_STATE_TTL_SEC,
     CAPS_REVALIDATE_EVERY,
     REQUIRE_ENDPOINTS,
+    ATTEMPT_ID_ENABLED,
+)
+from handler.dial_attempt import (
+    get_attempt_id,
+    new_attempt_id,
+    store_attempt_id,
 )
 from handler.event_stream import notify_dialer_event
 from handler.origin_guardrails import (
@@ -346,9 +352,16 @@ FAIL_EVENTS = [
 
 # fail statuses with no incidence rules
 FAIL_NO_RULES_EVENTS = [
-    'CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'AMD', 'EXIT_SHORTCALL',
-    'ORIGINATE_FAILED', '404_NOT_FOUND', 'EXIT_ABANDON', 'EXIT_TIMEOUT',
+    'CHANUNAVAIL', 'INVALID_NUMBER', 'CANCEL', 'EXIT_SHORTCALL',
+    'ORIGINATE_FAILED', '404_NOT_FOUND', 'EXIT_ABANDON',
 ]
+
+# Dial status → incidence_rules.status lookup (UI labels).
+# History/metrics keep the original event; only rule lookup is aliased.
+INCIDENCE_RULE_EVENT_MAP = {
+    'AMD': 'TERMINATED',          # UI Contestador
+    'EXIT_TIMEOUT': 'TIMEOUT',    # UI Timeout = timeout de cola post-connect
+}
 
 # P_hit / Drop — taxonomía canónica (H3)
 #
@@ -3032,6 +3045,21 @@ class AverageWorker(DialerWorker):
             )
         except Exception:
             pass
+        # M0: attempt_id dialer-owned (aditivo; no cambia cupo).
+        if ATTEMPT_ID_ENABLED:
+            try:
+                store_attempt_id(
+                    cls.REDIS_DIALER_CONNECTION,
+                    id_campaign,
+                    contact_id,
+                    new_attempt_id(),
+                    CALLS_PHASE_TTL_SEC,
+                )
+            except Exception:
+                logger.debug(
+                    'Campaign %s: store attempt_id failed contact=%s',
+                    id_campaign, contact_id, exc_info=True,
+                )
         cls._publish_calls_count(id_campaign)
         return RESERVE_OK
 
@@ -4929,8 +4957,16 @@ class AverageWorker(DialerWorker):
                                 phone_to_dial = prefix[0] + phone_number
                             except Exception:
                                 phone_to_dial = str(prefix) + phone_number
+                        dial_attrs = None
+                        if ATTEMPT_ID_ENABLED:
+                            aid = get_attempt_id(
+                                cls.REDIS_DIALER_CONNECTION, id_campaign, id_contact,
+                            )
+                            if aid:
+                                dial_attrs = {'attempt_id': aid}
                         success = cls.trigger_acd_dial(
-                            phone_to_dial, id_campaign, id_contact, attributes=None
+                            phone_to_dial, id_campaign, id_contact,
+                            attributes=dial_attrs,
                         )
                         if not success:
                             raise Exception("Failed to send dial job to Gearman")
@@ -5186,13 +5222,16 @@ class AverageWorker(DialerWorker):
         #   if the contact's history and the incidence rule indicates that the
         #   contact must be called again, schedule a call according to the incidence rule
         cls.connect_redis_dialer()
-        status_code = NAME_TO_STATUS[status]
+        # Count attempts with the real dial status (AMD stays AMD in HISTORY).
+        history_status_code = NAME_TO_STATUS[status]
+        # Rule lookup may alias (AMD → TERMINATED / Contestador in OML UI).
+        rule_status = INCIDENCE_RULE_EVENT_MAP.get(status, status)
         with cls.get_dialer_connection() as conn_dialer:
             cursor_dialer = conn_dialer.cursor()
-            incidence_rule = cls.get_incidence_rule(id_campaign, status)
+            incidence_rule = cls.get_incidence_rule(id_campaign, rule_status)
             cls.apply_incidence_rule(
-                cursor_dialer, incidence_rule, contact_id, id_campaign, status_code,
-                PHONE_TYPE, phone_number)
+                cursor_dialer, incidence_rule, contact_id, id_campaign,
+                history_status_code, PHONE_TYPE, phone_number)
 
     @classmethod
     @job_handler_decorator
@@ -5243,11 +5282,18 @@ class AverageWorker(DialerWorker):
             )
             raise
 
+        attempt_id = ari_event_data.get('attempt_id') or ''
+        if attempt_id:
+            logger.debug(
+                "process_event [%s]: attempt_id=%s (M0 echo; cupo sigue "
+                "contact/callid)",
+                callid, attempt_id,
+            )
         logger.info(
             "process_event [%s]: recibido | campaign=%s contact=%s phone=%s "
-            "type=%s call_type=%s dialstatus=%s dialstring=%s",
+            "type=%s call_type=%s dialstatus=%s dialstring=%s attempt_id=%s",
             callid, id_campaign, contact_id, phone_number,
-            event_type, call_type, dialstatus, dialstring,
+            event_type, call_type, dialstatus, dialstring, attempt_id or '-',
         )
 
         # ----- RouteValidationFailed (llamada bloqueada por validación de ruta): decrementar -----
@@ -6287,6 +6333,11 @@ class AverageWorker(DialerWorker):
             return AdminRender.render_stats(
                 id_campaign, stats,
                 predictive=cls.collect_predictive_stats(id_campaign))
+        if data['type'] == 'stats_inner':
+            id_campaign = data['id_campaign']
+            cls.connect_redis_dialer()
+            stats = cls.REDIS_DIALER_CONNECTION.hgetall(f'CAMP:{id_campaign}:COUNTER')
+            return AdminRender.render_stats_inner(id_campaign, stats)
         if data['type'] == 'pacing':
             id_campaign = data['id_campaign']
             return AdminRender.render_pacing(
@@ -6787,10 +6838,19 @@ class SchedulerWorker(AverageWorker):
                 return 'Skipped: contact already in flight'
             return 'Skipped: no free dialer channels'
 
+        dial_attrs = None
+        if ATTEMPT_ID_ENABLED:
+            cls.connect_redis_dialer()
+            aid = get_attempt_id(
+                cls.REDIS_DIALER_CONNECTION, id_campaign, id_contact,
+            )
+            if aid:
+                dial_attrs = {'attempt_id': aid}
         success = cls.trigger_acd_dial(
             phone_number=phone_number,
             campaign_id=id_campaign,
             contact_id=id_contact,
+            attributes=dial_attrs,
         )
         if success:
             return 'GD!!!'

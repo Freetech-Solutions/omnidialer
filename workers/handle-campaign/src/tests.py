@@ -18,7 +18,7 @@ from handler.naive import (
     AverageWorker, SchedulerWorker, ACTIVE, PAUSED, CREATED, FINALIZED,
     STATUS_SELECTED_CALL, STATUS_CREATED, STATUS_ANSWERED_AGENT,
     FINALIZED_NOCONTACT, PENDING_ATTEMPTS, STATUS_AMD_MACHINE,
-    STATUS_TERMINATED, STATUS_EXIT_ABANDON, STATUS_EXIT_TIMEOUT,
+    STATUS_TERMINATED, STATUS_TIMEOUT, STATUS_EXIT_ABANDON, STATUS_EXIT_TIMEOUT,
     AUDIT_LOCK_KEY, AUDIT_ACTIVE_CHANNELS_JOB,
     PHASE_RINGING, PHASE_WAITING_AGENT, PHASE_ONCALL,
     SCHEDULER_LEADER_KEY,
@@ -60,6 +60,8 @@ class PredictiveConstantsTests(unittest.TestCase):
         self.assertEqual(dialer_settings.THROTTLE_EXIT_RATIO, 0.8)
         self.assertEqual(dialer_settings.THROTTLE_STATE_TTL_SEC, 300)
         self.assertEqual(dialer_settings.CAPS_REVALIDATE_EVERY, 3)
+        self.assertTrue(dialer_settings.ATTEMPT_ID_ENABLED)
+        self.assertEqual(naive_mod.ATTEMPT_ID_ENABLED, dialer_settings.ATTEMPT_ID_ENABLED)
         self.assertEqual(naive_mod.MAX_ABANDON_RATE, dialer_settings.MAX_ABANDON_RATE)
         self.assertEqual(naive_mod.WARM_UP_SAMPLE_SIZE, dialer_settings.WARM_UP_SAMPLE_SIZE)
         self.assertEqual(naive_mod.PREDICTIVE_TICK_MS, dialer_settings.PREDICTIVE_TICK_MS)
@@ -585,7 +587,15 @@ class PredictiveStatsHtmxTests(unittest.TestCase):
             predictive=AverageWorker.collect_predictive_stats(cid))
         self.assertIn('ATTEMPTED_CALLS', html)
         self.assertIn(f'/htmx/pacing/{cid}', html)
-        self.assertIn('every 5s', html)
+        self.assertIn(f'/htmx/stats/inner/{cid}', html)
+        self.assertEqual(html.count('every 5s'), 2)
+
+    def test_render_stats_inner_html_lists_counters(self):
+        from ui.rendering import AdminRender
+        html = AdminRender.render_stats_inner(
+            self.campaign_id, {'ATTEMPTED_CALLS': '7'})
+        self.assertIn('ATTEMPTED_CALLS', html)
+        self.assertIn('list-group', html)
 
 
 class CampaignThrottleFailClosedUnitTests(unittest.TestCase):
@@ -2005,9 +2015,13 @@ class MyTestSuite(unittest.TestCase):
     def setUp(self):
         self._wait_pg()
         self.fetchmany_counter = 0
+        AverageWorker.get_incidence_rule.cache_clear()
+        AverageWorker.get_incidence_rule_disposition.cache_clear()
         self._create_campaign()
 
     def tearDown(self):
+        AverageWorker.get_incidence_rule.cache_clear()
+        AverageWorker.get_incidence_rule_disposition.cache_clear()
         self.clean_databases()
 
     @classmethod
@@ -2192,6 +2206,76 @@ class MyTestSuite(unittest.TestCase):
         # check that a job was submitted to 'schedule-contact'
         self.assertEqual(AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][0],
                          'schedule-agenda')
+
+    def test_amd_uses_contestador_terminated_incidence_rule(self):
+        """Dial AMD looks up UI Contestador rule (TERMINATED) and schedules retry."""
+        AverageWorker.GM_CLIENT.submit_job = MagicMock()
+        AverageWorker.get_incidence_rule.cache_clear()
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn_dialer:
+            cursor_dialer = conn_dialer.cursor()
+            cursor_dialer.execute(
+                """INSERT INTO incidence_rules (id, status, status_custom, max_attempt,
+                retry_later, in_mode, campaign_id) VALUES
+                (%s, %s, %s, %s, %s, %s, %s);""",
+                (30, STATUS_TERMINATED, 'CONTESTADOR', 1, 60, 1, 4))
+        amd_event = self.gen_fail_event('AMD')
+        amd_event['callid'] = 'amd-incidence-1'
+        job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(amd_event), encoding='UTF8'),
+        )
+        AverageWorker.process_event(self.worker, job)
+        self.assertEqual(
+            AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][0],
+            'schedule-agenda',
+        )
+        agenda = json.loads(AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][1])
+        self.assertEqual(agenda['type'], 'incidence_rule')
+        self.assertEqual(str(agenda['id_campaign']), '4')
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn_dialer:
+            cursor_dialer = conn_dialer.cursor()
+            cursor_dialer.execute(
+                'SELECT final_status, status FROM contact_in_campaign '
+                'WHERE id_campaign = 4 AND id_contact = 1',
+            )
+            final_status, contact_status = cursor_dialer.fetchone()
+            self.assertEqual(final_status, PENDING_ATTEMPTS)
+            self.assertEqual(contact_status, STATUS_AMD_MACHINE)
+
+    def test_exit_timeout_uses_timeout_incidence_rule(self):
+        """Dial EXIT_TIMEOUT looks up UI Timeout rule and schedules retry."""
+        AverageWorker.GM_CLIENT.submit_job = MagicMock()
+        AverageWorker.get_incidence_rule.cache_clear()
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn_dialer:
+            cursor_dialer = conn_dialer.cursor()
+            cursor_dialer.execute(
+                """INSERT INTO incidence_rules (id, status, status_custom, max_attempt,
+                retry_later, in_mode, campaign_id) VALUES
+                (%s, %s, %s, %s, %s, %s, %s);""",
+                (31, STATUS_TIMEOUT, '', 1, 60, 1, 4))
+        event = self.gen_fail_event('EXIT_TIMEOUT')
+        event['callid'] = 'exit-timeout-incidence-1'
+        job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(event), encoding='UTF8'),
+        )
+        AverageWorker.process_event(self.worker, job)
+        self.assertEqual(
+            AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][0],
+            'schedule-agenda',
+        )
+        agenda = json.loads(AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][1])
+        self.assertEqual(agenda['type'], 'incidence_rule')
+        self.assertEqual(str(agenda['id_campaign']), '4')
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn_dialer:
+            cursor_dialer = conn_dialer.cursor()
+            cursor_dialer.execute(
+                'SELECT final_status, status FROM contact_in_campaign '
+                'WHERE id_campaign = 4 AND id_contact = 1',
+            )
+            final_status, contact_status = cursor_dialer.fetchone()
+            self.assertEqual(final_status, PENDING_ATTEMPTS)
+            self.assertEqual(contact_status, STATUS_EXIT_TIMEOUT)
 
     def test_process_event_missing_explicit_fields_fails_fast(self):
         AverageWorker.GM_CLIENT.submit_job = MagicMock()
@@ -3278,7 +3362,9 @@ class MyTestSuite(unittest.TestCase):
                     ' AND id_contact = 1;'
                 )
                 self.assertEqual(cursor_dialer.fetchone()[0], STATUS_EXIT_TIMEOUT)
-            AverageWorker.handle_incidence_rules.assert_not_called()
+            AverageWorker.handle_incidence_rules.assert_called_once_with(
+                'EXIT_TIMEOUT', '4', '1', '6093017590',
+            )
         finally:
             AverageWorker.handle_incidence_rules = original_incidence
 
@@ -3675,11 +3761,14 @@ class MyTestSuite(unittest.TestCase):
             result = SchedulerWorker.schedule_contact('6093017590', 4, 1)
 
             self.assertEqual(result, 'GD!!!')
-            SchedulerWorker.trigger_acd_dial.assert_called_once_with(
-                phone_number='6093017590',
-                campaign_id=4,
-                contact_id=1,
-            )
+            SchedulerWorker.trigger_acd_dial.assert_called_once()
+            call_kw = SchedulerWorker.trigger_acd_dial.call_args.kwargs
+            self.assertEqual(call_kw.get('phone_number'), '6093017590')
+            self.assertEqual(call_kw.get('campaign_id'), 4)
+            self.assertEqual(call_kw.get('contact_id'), 1)
+            attrs = call_kw.get('attributes') or {}
+            self.assertIn('attempt_id', attrs)
+            self.assertTrue(attrs['attempt_id'])
             val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
             self.assertEqual(int(val), 2)
             phases = AverageWorker.get_campaign_channel_phases(4)
@@ -3850,6 +3939,55 @@ class MyTestSuite(unittest.TestCase):
         self.assertEqual(phases[PHASE_ONCALL], 0)
         phase = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:PHASE:4:1')
         self.assertEqual(phase, PHASE_RINGING)
+
+    def test_reserve_stores_attempt_id_when_enabled(self):
+        import settings.default as dialer_settings
+        from handler.dial_attempt import attempt_redis_key, get_attempt_id
+        self.assertTrue(dialer_settings.ATTEMPT_ID_ENABLED)
+        self._set_campaign_active(4, max_channels=5)
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 0)
+        AverageWorker._init_campaign_channel_phases(4)
+        self.assertEqual(AverageWorker._reserve_dialer_channel(4, 1), RESERVE_OK)
+        aid = get_attempt_id(AverageWorker.REDIS_DIALER_CONNECTION, 4, 1)
+        self.assertIsNotNone(aid)
+        self.assertTrue(len(aid) >= 32)
+        raw = AverageWorker.REDIS_DIALER_CONNECTION.get(attempt_redis_key(4, 1))
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8')
+        self.assertEqual(raw, aid)
+
+    def test_trigger_acd_dial_includes_attempt_id_in_metadata(self):
+        captured = {}
+
+        class _FakeClient:
+            def submit_job(self, job_name, message, background=True):
+                captured['job'] = job_name
+                captured['payload'] = json.loads(message)
+
+        AverageWorker.GM_CLIENT = _FakeClient()
+        ok = AverageWorker.trigger_acd_dial(
+            '6093017590', 4, 1, attributes={'attempt_id': 'att-test-1'},
+        )
+        self.assertTrue(ok)
+        self.assertEqual(captured['job'], 'acd-call-processor')
+        self.assertEqual(captured['payload']['metadata']['attempt_id'], 'att-test-1')
+
+    def test_reserve_skips_attempt_id_when_flag_off(self):
+        import handler.naive as naive_mod
+        self._set_campaign_active(4, max_channels=5)
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 0)
+        AverageWorker._init_campaign_channel_phases(4)
+        original = naive_mod.ATTEMPT_ID_ENABLED
+        naive_mod.ATTEMPT_ID_ENABLED = False
+        try:
+            self.assertEqual(AverageWorker._reserve_dialer_channel(4, 2), RESERVE_OK)
+            self.assertIsNone(
+                AverageWorker.REDIS_DIALER_CONNECTION.get('OML:ATTEMPT:4:2'),
+            )
+        finally:
+            naive_mod.ATTEMPT_ID_ENABLED = original
 
     def test_reserve_at_max_does_not_leave_orphan_phase(self):
         self._set_campaign_active(4, max_channels=1)
@@ -4667,7 +4805,10 @@ class StabilizationFixesUnitTests(unittest.TestCase):
         AverageWorker.handle_incidence_rules = MagicMock()
         AverageWorker._finalize_contact_nocontact = MagicMock()
         try:
-            for dialstatus in ('EXIT_ABANDON', 'EXIT_TIMEOUT', 'CHANUNAVAIL', 'AMD', 'ORIGINATE_FAILED'):
+            for dialstatus in (
+                'EXIT_ABANDON', 'CHANUNAVAIL', 'ORIGINATE_FAILED',
+            ):
+                AverageWorker.handle_incidence_rules.reset_mock()
                 AverageWorker._finalize_contact_nocontact.reset_mock()
                 AverageWorker.handle_fail_event(
                     {'dialstatus': dialstatus, 'type': 'Dial'},
@@ -4675,6 +4816,56 @@ class StabilizationFixesUnitTests(unittest.TestCase):
                 )
                 AverageWorker.handle_incidence_rules.assert_not_called()
                 AverageWorker._finalize_contact_nocontact.assert_called_once_with(4, 10)
+        finally:
+            AverageWorker.set_contact_status = orig_set_status
+            AverageWorker.handle_incidence_rules = orig_incidence
+            AverageWorker._finalize_contact_nocontact = orig_finalize
+
+    def test_amd_fail_event_uses_incidence_rules_not_finalize(self):
+        """AMD applies Contestador incidence path (not FAIL_NO_RULES finalize)."""
+        orig_set_status = AverageWorker.set_contact_status
+        orig_incidence = AverageWorker.handle_incidence_rules
+        orig_finalize = AverageWorker._finalize_contact_nocontact
+        AverageWorker.set_contact_status = MagicMock()
+        AverageWorker.handle_incidence_rules = MagicMock()
+        AverageWorker._finalize_contact_nocontact = MagicMock()
+        try:
+            AverageWorker.handle_fail_event(
+                {'dialstatus': 'AMD', 'type': 'Dial'},
+                id_campaign=4, contact_id=10, phone_number='6093017590',
+            )
+            AverageWorker.set_contact_status.assert_called_once_with(
+                4, 10, 'AMD',
+            )
+            AverageWorker.handle_incidence_rules.assert_called_once_with(
+                'AMD', 4, 10, '6093017590',
+            )
+            AverageWorker._finalize_contact_nocontact.assert_not_called()
+        finally:
+            AverageWorker.set_contact_status = orig_set_status
+            AverageWorker.handle_incidence_rules = orig_incidence
+            AverageWorker._finalize_contact_nocontact = orig_finalize
+
+    def test_exit_timeout_fail_event_uses_incidence_rules_not_finalize(self):
+        """EXIT_TIMEOUT applies UI Timeout incidence path (not FAIL_NO_RULES)."""
+        orig_set_status = AverageWorker.set_contact_status
+        orig_incidence = AverageWorker.handle_incidence_rules
+        orig_finalize = AverageWorker._finalize_contact_nocontact
+        AverageWorker.set_contact_status = MagicMock()
+        AverageWorker.handle_incidence_rules = MagicMock()
+        AverageWorker._finalize_contact_nocontact = MagicMock()
+        try:
+            AverageWorker.handle_fail_event(
+                {'dialstatus': 'EXIT_TIMEOUT', 'type': 'Dial'},
+                id_campaign=4, contact_id=10, phone_number='6093017590',
+            )
+            AverageWorker.set_contact_status.assert_called_once_with(
+                4, 10, 'EXIT_TIMEOUT',
+            )
+            AverageWorker.handle_incidence_rules.assert_called_once_with(
+                'EXIT_TIMEOUT', 4, 10, '6093017590',
+            )
+            AverageWorker._finalize_contact_nocontact.assert_not_called()
         finally:
             AverageWorker.set_contact_status = orig_set_status
             AverageWorker.handle_incidence_rules = orig_incidence
