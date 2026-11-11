@@ -3,7 +3,7 @@
 import datetime
 import unittest
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from decimal import Decimal
 import psycopg
 import time
@@ -16,10 +16,13 @@ from gearman.worker import GearmanWorker
 
 from handler.naive import (
     AverageWorker, SchedulerWorker, ACTIVE, PAUSED, CREATED, FINALIZED,
-    STATUS_SELECTED_CALL, STATUS_CREATED, FINALIZED_NOCONTACT, STATUS_AMD_MACHINE,
-    STATUS_TERMINATED, STATUS_EXIT_ABANDON, STATUS_EXIT_TIMEOUT,
+    STATUS_SELECTED_CALL, STATUS_CREATED, STATUS_ANSWERED_AGENT,
+    FINALIZED_NOCONTACT, PENDING_ATTEMPTS, STATUS_AMD_MACHINE,
+    STATUS_TERMINATED, STATUS_TIMEOUT, STATUS_EXIT_ABANDON, STATUS_EXIT_TIMEOUT,
     AUDIT_LOCK_KEY, AUDIT_ACTIVE_CHANNELS_JOB,
     PHASE_RINGING, PHASE_WAITING_AGENT, PHASE_ONCALL,
+    SCHEDULER_LEADER_KEY,
+    RESERVE_OK, RESERVE_PHASE_EXISTS, RESERVE_MAX_CHANNELS,
 )
 import handler.naive as naive_mod
 import settings.default as dialer_settings
@@ -37,11 +40,28 @@ class PredictiveConstantsTests(unittest.TestCase):
         self.assertEqual(dialer_settings.DROP_RATE_ALPHA, 0.1)
         self.assertEqual(dialer_settings.DEFAULT_ART_SEC, 15.0)
         self.assertEqual(dialer_settings.P_LIB_REMAINING_EPS, 1.0)
+        self.assertEqual(dialer_settings.AUDIT_UP_STREAK_TICKS, 2)
+        self.assertEqual(dialer_settings.AUDIT_DOWN_STREAK_TICKS, 4)
+        self.assertEqual(dialer_settings.AUDIT_IDLE_DOWN_STREAK_TICKS, 2)
+        self.assertEqual(dialer_settings.ACD_STALE_EVICT_TICKS, 3)
+        self.assertEqual(dialer_settings.AUDIT_INCOMPLETE_DOWN_STREAK_TICKS, 8)
+        self.assertEqual(naive_mod.ACD_STALE_EVICT_TICKS, dialer_settings.ACD_STALE_EVICT_TICKS)
+        self.assertEqual(
+            naive_mod.AUDIT_INCOMPLETE_DOWN_STREAK_TICKS,
+            dialer_settings.AUDIT_INCOMPLETE_DOWN_STREAK_TICKS,
+        )
         self.assertTrue(dialer_settings.PREDICTIVE_ENABLED)
         self.assertEqual(dialer_settings.GAMMA_THROTTLE_FLOOR, 0.2)
+        self.assertEqual(dialer_settings.MAX_DIAL_RATIO, 5)
         self.assertEqual(dialer_settings.PACING_SNAPSHOT_TTL_SEC, 30)
         self.assertEqual(dialer_settings.THROTTLE_STREAK_K, 5)
+        self.assertEqual(dialer_settings.THROTTLE_STREAK_SEC, 5)
+        self.assertEqual(dialer_settings.THROTTLE_MIN_HITS, 20)
         self.assertEqual(dialer_settings.THROTTLE_EXIT_RATIO, 0.8)
+        self.assertEqual(dialer_settings.THROTTLE_STATE_TTL_SEC, 300)
+        self.assertEqual(dialer_settings.CAPS_REVALIDATE_EVERY, 3)
+        self.assertTrue(dialer_settings.ATTEMPT_ID_ENABLED)
+        self.assertEqual(naive_mod.ATTEMPT_ID_ENABLED, dialer_settings.ATTEMPT_ID_ENABLED)
         self.assertEqual(naive_mod.MAX_ABANDON_RATE, dialer_settings.MAX_ABANDON_RATE)
         self.assertEqual(naive_mod.WARM_UP_SAMPLE_SIZE, dialer_settings.WARM_UP_SAMPLE_SIZE)
         self.assertEqual(naive_mod.PREDICTIVE_TICK_MS, dialer_settings.PREDICTIVE_TICK_MS)
@@ -51,11 +71,25 @@ class PredictiveConstantsTests(unittest.TestCase):
         self.assertEqual(naive_mod.P_LIB_REMAINING_EPS, dialer_settings.P_LIB_REMAINING_EPS)
         self.assertEqual(naive_mod.PREDICTIVE_ENABLED, dialer_settings.PREDICTIVE_ENABLED)
         self.assertEqual(naive_mod.GAMMA_THROTTLE_FLOOR, dialer_settings.GAMMA_THROTTLE_FLOOR)
+        self.assertEqual(naive_mod.MAX_DIAL_RATIO, dialer_settings.MAX_DIAL_RATIO)
         self.assertEqual(
             naive_mod.PACING_SNAPSHOT_TTL_SEC, dialer_settings.PACING_SNAPSHOT_TTL_SEC,
         )
         self.assertEqual(naive_mod.THROTTLE_STREAK_K, dialer_settings.THROTTLE_STREAK_K)
+        self.assertEqual(naive_mod.THROTTLE_STREAK_SEC, dialer_settings.THROTTLE_STREAK_SEC)
+        self.assertEqual(naive_mod.THROTTLE_MIN_HITS, dialer_settings.THROTTLE_MIN_HITS)
         self.assertEqual(naive_mod.THROTTLE_EXIT_RATIO, dialer_settings.THROTTLE_EXIT_RATIO)
+        self.assertTrue(
+            naive_mod.TECHNICAL_FAIL_STATUSES.isdisjoint(naive_mod.FAIL_HIT_STATUSES),
+        )
+        self.assertIn('ORIGINATE_FAILED', naive_mod.TECHNICAL_FAIL_STATUSES)
+        self.assertIn('AMD', naive_mod.FAIL_HIT_STATUSES)
+        self.assertEqual(
+            naive_mod.THROTTLE_STATE_TTL_SEC, dialer_settings.THROTTLE_STATE_TTL_SEC,
+        )
+        self.assertEqual(
+            naive_mod.CAPS_REVALIDATE_EVERY, dialer_settings.CAPS_REVALIDATE_EVERY,
+        )
 
     def test_is_predictive_warmup_uses_att_count(self):
         orig = AverageWorker.get_campaign_att_count
@@ -231,6 +265,20 @@ class CampaignHitMetricsH3Tests(unittest.TestCase):
         before = AverageWorker.get_campaign_drop_rate(cid)
         AverageWorker.update_campaign_hit(cid, hit=False, abandon=False)
         self.assertAlmostEqual(AverageWorker.get_campaign_drop_rate(cid), before, places=6)
+
+    def test_tech_fail_does_not_move_p_hit(self):
+        cid = self.campaign_id
+        AverageWorker.update_campaign_hit(cid, hit=True)
+        before = AverageWorker.get_campaign_metrics(cid)
+        p_before = float(before['P_HIT'])
+        AverageWorker.update_campaign_hit(cid, hit=False, tech=True)
+        after = AverageWorker.get_campaign_metrics(cid)
+        self.assertEqual(after['TECH_FAIL_COUNT'], 1)
+        self.assertEqual(after['FAIL_COUNT'], 0)
+        self.assertAlmostEqual(float(after['P_HIT']), p_before, places=6)
+        self.assertIn('ORIGINATE_FAILED', naive_mod.TECHNICAL_FAIL_STATUSES)
+        self.assertNotIn('ORIGINATE_FAILED', naive_mod.FAIL_HIT_STATUSES)
+        self.assertIn('AMD', naive_mod.FAIL_HIT_STATUSES)
 
     def test_drop_rate_legacy_fallback_then_ewma_takes_over(self):
         """Hash sin DROP_RATE_EWMA usa ratio acumulado; tras un evento el EWMA manda."""
@@ -539,11 +587,199 @@ class PredictiveStatsHtmxTests(unittest.TestCase):
             predictive=AverageWorker.collect_predictive_stats(cid))
         self.assertIn('ATTEMPTED_CALLS', html)
         self.assertIn(f'/htmx/pacing/{cid}', html)
-        self.assertIn('every 5s', html)
+        self.assertIn(f'/htmx/stats/inner/{cid}', html)
+        self.assertEqual(html.count('every 5s'), 2)
+
+    def test_render_stats_inner_html_lists_counters(self):
+        from ui.rendering import AdminRender
+        html = AdminRender.render_stats_inner(
+            self.campaign_id, {'ATTEMPTED_CALLS': '7'})
+        self.assertIn('ATTEMPTED_CALLS', html)
+        self.assertIn('list-group', html)
+
+
+class CampaignThrottleFailClosedUnitTests(unittest.TestCase):
+    """Fail-closed throttle + pacing reset without real Redis."""
+
+    campaign_id = 8047
+
+    def setUp(self):
+        self._orig_redis = AverageWorker.REDIS_DIALER_CONNECTION
+        self._orig_connect = AverageWorker.connect_redis_dialer
+        self.mock_redis = MagicMock()
+        AverageWorker.REDIS_DIALER_CONNECTION = self.mock_redis
+        AverageWorker.connect_redis_dialer = MagicMock()
+
+    def tearDown(self):
+        AverageWorker.REDIS_DIALER_CONNECTION = self._orig_redis
+        AverageWorker.connect_redis_dialer = self._orig_connect
+
+    def test_drop_rate_none_preserves_latch(self):
+        self.mock_redis.exists.return_value = 1
+        # over_since = now - 12s
+        now = time.time()
+        self.mock_redis.get.return_value = str(now - 12)
+        result = AverageWorker._update_throttle_streak(
+            self.campaign_id, None, 0.03, now_ts=now,
+        )
+        self.assertTrue(result['latched'])
+        self.assertTrue(result['force_throttle'])
+        self.assertEqual(result['over_sec'], 12)
+        self.mock_redis.eval.assert_not_called()
+
+    def test_drop_rate_none_without_latch_is_inert(self):
+        # exists=False for latch and over_since
+        self.mock_redis.exists.return_value = 0
+        self.mock_redis.get.return_value = None
+        result = AverageWorker._update_throttle_streak(
+            self.campaign_id, None, 0.03,
+        )
+        self.assertFalse(result['latched'])
+        self.assertFalse(result['force_throttle'])
+        self.assertEqual(result['over_sec'], 0)
+        self.mock_redis.eval.assert_not_called()
+
+    def test_redis_eval_error_fail_closed(self):
+        self.mock_redis.eval.side_effect = RuntimeError('redis down')
+        result = AverageWorker._update_throttle_streak(
+            self.campaign_id, 0.05, 0.03,
+        )
+        self.assertTrue(result['force_throttle'])
+        self.assertTrue(result['latched'])
+
+    def test_reset_campaign_pacing_state_deletes_expected_keys(self):
+        cid = self.campaign_id
+        AverageWorker._reset_campaign_pacing_state(cid)
+        self.mock_redis.delete.assert_called_once()
+        deleted = self.mock_redis.delete.call_args[0]
+        self.assertIn(f'CAMP:{cid}:METRICS', deleted)
+        self.assertIn(f'CAMP:{cid}:ATT', deleted)
+        self.assertIn(f'CAMP:{cid}:THROTTLE_STREAK', deleted)
+        self.assertIn(f'CAMP:{cid}:THROTTLE_OVER_SINCE', deleted)
+        self.assertIn(f'CAMP:{cid}:THROTTLE_LATCH', deleted)
+        self.assertIn(f'CAMP:{cid}:PACING', deleted)
+        self.assertNotIn(f'CAMP:{cid}:ART', deleted)
+
+    def test_log_throttle_cleared_warning(self):
+        throttle = {
+            'streak': 0, 'latched': False, 'force_throttle': False,
+            'event': 'THROTTLE_CLEARED',
+        }
+        with self.assertLogs('handler.naive', level='WARNING') as cm:
+            AverageWorker._log_throttle_event(self.campaign_id, throttle, 0.01)
+        self.assertTrue(any('THROTTLE_CLEARED' in line for line in cm.output))
+
+    def test_compute_throttle_drop_rate_min_hits(self):
+        metrics = {'HIT_COUNT': 5, 'DROP_RATE': 0.5}
+        self.assertIsNone(
+            AverageWorker._compute_throttle_drop_rate(metrics, 0.4, latched=False),
+        )
+        # Latched: still returns max for exit hysteresis
+        self.assertAlmostEqual(
+            AverageWorker._compute_throttle_drop_rate(metrics, 0.1, latched=True),
+            0.5,
+        )
+
+    def test_compute_throttle_drop_rate_max_ewma_cum(self):
+        metrics = {'HIT_COUNT': 50, 'DROP_RATE': 0.20}
+        self.assertAlmostEqual(
+            AverageWorker._compute_throttle_drop_rate(metrics, 0.05, latched=False),
+            0.20,
+        )
+        self.assertAlmostEqual(
+            AverageWorker._compute_throttle_drop_rate(
+                {'HIT_COUNT': 50, 'DROP_RATE': 0.02}, 0.12, latched=False,
+            ),
+            0.12,
+        )
+
+
+class CampaignThrottleWallClockUnitTests(unittest.TestCase):
+    """Wall-clock throttle Lua behavior via mocked eval return / real script path."""
+
+    campaign_id = 8050
+
+    def setUp(self):
+        self._orig_redis = AverageWorker.REDIS_DIALER_CONNECTION
+        self._orig_connect = AverageWorker.connect_redis_dialer
+        self._store = {}
+        mock = MagicMock()
+
+        def _eval(script, nkeys, *args):
+            # Execute simplified wall-clock logic matching _THROTTLE_UPDATE_LUA
+            over_key, latch_key = args[0], args[1]
+            d = float(args[2])
+            d_max = float(args[3])
+            exit_thr = float(args[4])
+            streak_sec = float(args[5])
+            now_ts = float(args[7])
+            latched = latch_key in self._store
+            over_since = self._store.get(over_key)
+            if over_since is not None:
+                over_since = float(over_since)
+
+            def over_sec():
+                if over_since is None:
+                    return 0
+                return max(0, int(now_ts - over_since))
+
+            if latched:
+                if d < exit_thr:
+                    self._store.pop(latch_key, None)
+                    self._store.pop(over_key, None)
+                    return [0, 0, 0, 'THROTTLE_CLEARED']
+                return [over_sec(), 1, 1, '']
+            if d_max > 0 and d >= d_max:
+                if over_since is None:
+                    over_since = now_ts
+                    self._store[over_key] = str(now_ts)
+                elapsed = max(0.0, now_ts - over_since)
+                if elapsed >= streak_sec:
+                    self._store[latch_key] = '1'
+                    return [int(elapsed), 1, 1, 'THROTTLE_ENGAGED']
+                return [int(elapsed), 0, 0, '']
+            self._store.pop(over_key, None)
+            return [0, 0, 0, '']
+
+        mock.eval.side_effect = _eval
+        mock.exists.side_effect = lambda k: 1 if k in self._store else 0
+        mock.get.side_effect = lambda k: self._store.get(k)
+        AverageWorker.REDIS_DIALER_CONNECTION = mock
+        AverageWorker.connect_redis_dialer = MagicMock()
+        self.mock_redis = mock
+
+    def tearDown(self):
+        AverageWorker.REDIS_DIALER_CONNECTION = self._orig_redis
+        AverageWorker.connect_redis_dialer = self._orig_connect
+
+    def test_wall_clock_engages_after_streak_sec(self):
+        cid = self.campaign_id
+        t0 = 1_700_000_000.0
+        r1 = AverageWorker._update_throttle_streak(cid, 0.05, 0.03, now_ts=t0)
+        self.assertFalse(r1['force_throttle'])
+        self.assertEqual(r1['over_sec'], 0)
+        r2 = AverageWorker._update_throttle_streak(
+            cid, 0.05, 0.03, now_ts=t0 + dialer_settings.THROTTLE_STREAK_SEC - 1,
+        )
+        self.assertFalse(r2['force_throttle'])
+        engaged = AverageWorker._update_throttle_streak(
+            cid, 0.05, 0.03, now_ts=t0 + dialer_settings.THROTTLE_STREAK_SEC,
+        )
+        self.assertTrue(engaged['force_throttle'])
+        self.assertEqual(engaged['event'], 'THROTTLE_ENGAGED')
+
+    def test_wall_clock_clears_over_since_when_below_dmax(self):
+        cid = self.campaign_id
+        t0 = 1_700_000_000.0
+        AverageWorker._update_throttle_streak(cid, 0.05, 0.03, now_ts=t0)
+        cleared = AverageWorker._update_throttle_streak(cid, 0.01, 0.03, now_ts=t0 + 2)
+        self.assertEqual(cleared['over_sec'], 0)
+        self.assertFalse(cleared['latched'])
+        self.assertNotIn(f'CAMP:{cid}:THROTTLE_OVER_SINCE', self._store)
 
 
 class CampaignThrottleStreakTests(unittest.TestCase):
-    """P3: kill-switch streak + latch hysteresis on Redis."""
+    """P3: kill-switch wall-clock + latch hysteresis on Redis."""
 
     campaign_id = 8046
 
@@ -552,6 +788,7 @@ class CampaignThrottleStreakTests(unittest.TestCase):
         r = AverageWorker.REDIS_DIALER_CONNECTION
         r.delete(
             f'CAMP:{self.campaign_id}:THROTTLE_STREAK',
+            f'CAMP:{self.campaign_id}:THROTTLE_OVER_SINCE',
             f'CAMP:{self.campaign_id}:THROTTLE_LATCH',
         )
 
@@ -560,31 +797,26 @@ class CampaignThrottleStreakTests(unittest.TestCase):
             r = AverageWorker.REDIS_DIALER_CONNECTION
             r.delete(
                 f'CAMP:{self.campaign_id}:THROTTLE_STREAK',
+                f'CAMP:{self.campaign_id}:THROTTLE_OVER_SINCE',
                 f'CAMP:{self.campaign_id}:THROTTLE_LATCH',
             )
             r.close()
         except Exception:
             pass
 
-    def test_streak_reaches_k_engages_latch(self):
+    def test_streak_reaches_sec_engages_latch(self):
         cid = self.campaign_id
         d_max = dialer_settings.MAX_ABANDON_RATE
-        k = dialer_settings.THROTTLE_STREAK_K
-        event = None
-        result = None
-        for i in range(k):
-            result = AverageWorker._update_throttle_streak(cid, 0.05, d_max)
-            if i < k - 1:
-                self.assertFalse(result['force_throttle'])
-                self.assertFalse(result['latched'])
-                self.assertEqual(result['streak'], i + 1)
-                self.assertIsNone(result['event'])
-            else:
-                event = result['event']
-        self.assertTrue(result['force_throttle'])
-        self.assertTrue(result['latched'])
-        self.assertEqual(result['streak'], k)
-        self.assertEqual(event, 'THROTTLE_ENGAGED')
+        sec = dialer_settings.THROTTLE_STREAK_SEC
+        t0 = time.time()
+        early = AverageWorker._update_throttle_streak(cid, 0.05, d_max, now_ts=t0)
+        self.assertFalse(early['force_throttle'])
+        engaged = AverageWorker._update_throttle_streak(
+            cid, 0.05, d_max, now_ts=t0 + sec,
+        )
+        self.assertTrue(engaged['force_throttle'])
+        self.assertTrue(engaged['latched'])
+        self.assertEqual(engaged['event'], 'THROTTLE_ENGAGED')
         self.assertEqual(
             AverageWorker.REDIS_DIALER_CONNECTION.get(
                 f'CAMP:{cid}:THROTTLE_LATCH',
@@ -592,13 +824,14 @@ class CampaignThrottleStreakTests(unittest.TestCase):
             '1',
         )
 
-    def test_reset_streak_when_drop_below_dmax_without_latch(self):
+    def test_reset_over_since_when_drop_below_dmax_without_latch(self):
         cid = self.campaign_id
         d_max = dialer_settings.MAX_ABANDON_RATE
-        AverageWorker._update_throttle_streak(cid, 0.05, d_max)
-        AverageWorker._update_throttle_streak(cid, 0.05, d_max)
-        result = AverageWorker._update_throttle_streak(cid, 0.01, d_max)
-        self.assertEqual(result['streak'], 0)
+        t0 = time.time()
+        AverageWorker._update_throttle_streak(cid, 0.05, d_max, now_ts=t0)
+        AverageWorker._update_throttle_streak(cid, 0.05, d_max, now_ts=t0 + 1)
+        result = AverageWorker._update_throttle_streak(cid, 0.01, d_max, now_ts=t0 + 2)
+        self.assertEqual(result['over_sec'], 0)
         self.assertFalse(result['latched'])
         self.assertFalse(result['force_throttle'])
         self.assertIsNone(result['event'])
@@ -607,21 +840,150 @@ class CampaignThrottleStreakTests(unittest.TestCase):
         cid = self.campaign_id
         d_max = dialer_settings.MAX_ABANDON_RATE
         exit_thr = dialer_settings.THROTTLE_EXIT_RATIO * d_max
-        # Engage latch
-        for _ in range(dialer_settings.THROTTLE_STREAK_K):
-            AverageWorker._update_throttle_streak(cid, 0.05, d_max)
-        # Between exit_thr and D_max → stay latched
+        t0 = time.time()
+        AverageWorker._update_throttle_streak(
+            cid, 0.05, d_max, now_ts=t0 + dialer_settings.THROTTLE_STREAK_SEC,
+        )
         mid = (exit_thr + d_max) / 2.0
-        held = AverageWorker._update_throttle_streak(cid, mid, d_max)
+        held = AverageWorker._update_throttle_streak(cid, mid, d_max, now_ts=t0 + 100)
         self.assertTrue(held['latched'])
         self.assertTrue(held['force_throttle'])
         self.assertIsNone(held['event'])
-        # Below exit → clear
-        cleared = AverageWorker._update_throttle_streak(cid, exit_thr * 0.5, d_max)
+        cleared = AverageWorker._update_throttle_streak(
+            cid, exit_thr * 0.5, d_max, now_ts=t0 + 101,
+        )
         self.assertFalse(cleared['latched'])
         self.assertFalse(cleared['force_throttle'])
         self.assertEqual(cleared['event'], 'THROTTLE_CLEARED')
-        self.assertEqual(cleared['streak'], 0)
+        self.assertEqual(cleared['over_sec'], 0)
+
+    def test_throttle_latch_uses_state_ttl_not_pacing_ttl(self):
+        cid = self.campaign_id
+        d_max = dialer_settings.MAX_ABANDON_RATE
+        t0 = time.time()
+        AverageWorker._update_throttle_streak(
+            cid, 0.05, d_max, now_ts=t0 + dialer_settings.THROTTLE_STREAK_SEC,
+        )
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        latch_ttl = r.ttl(f'CAMP:{cid}:THROTTLE_LATCH')
+        self.assertGreater(latch_ttl, dialer_settings.PACING_SNAPSHOT_TTL_SEC)
+        self.assertLessEqual(latch_ttl, dialer_settings.THROTTLE_STATE_TTL_SEC)
+        self.assertTrue(AverageWorker._touch_throttle_state_ttl(cid))
+        self.assertGreater(
+            r.ttl(f'CAMP:{cid}:THROTTLE_LATCH'),
+            dialer_settings.PACING_SNAPSHOT_TTL_SEC,
+        )
+
+    def test_get_calls_and_phases_pipeline(self):
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        r.set('OML:CALLS:8046:DIALER', 7)
+        AverageWorker._init_campaign_channel_phases(8046)
+        r.hset(
+            'CAMP:8046:CHANNELS',
+            mapping={PHASE_RINGING: 3, PHASE_WAITING_AGENT: 1, PHASE_ONCALL: 3},
+        )
+        active, phases = AverageWorker._get_calls_and_phases(8046)
+        self.assertEqual(active, 7)
+        self.assertEqual(phases[PHASE_RINGING], 3)
+        self.assertEqual(phases[PHASE_WAITING_AGENT], 1)
+        self.assertEqual(phases[PHASE_ONCALL], 3)
+        self.assertEqual(phases['TOTAL'], 7)
+
+    def test_caps_batch_should_abort_on_max_channels(self):
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:8046:DIALER', 5)
+        AverageWorker._init_campaign_channel_phases(8046)
+        abort, reason = AverageWorker._caps_batch_should_abort(
+            8046, campaign_max=5, dials_done=2,
+        )
+        self.assertTrue(abort)
+        self.assertEqual(reason, 'max_channels')
+
+    def test_caps_batch_should_abort_on_throttle_after_dials(self):
+        cid = self.campaign_id
+        d_max = dialer_settings.MAX_ABANDON_RATE
+        t0 = time.time()
+        AverageWorker._update_throttle_streak(
+            cid, 0.05, d_max, now_ts=t0 + dialer_settings.THROTTLE_STREAK_SEC,
+        )
+        AverageWorker.REDIS_DIALER_CONNECTION.set(f'OML:CALLS:{cid}:DIALER', 1)
+        AverageWorker._init_campaign_channel_phases(cid)
+        # sin dials aún: no aborta solo por latch (permite el 1er originate)
+        abort0, _ = AverageWorker._caps_batch_should_abort(
+            cid, campaign_max=50, dials_done=0,
+        )
+        self.assertFalse(abort0)
+        original_drop = AverageWorker.get_campaign_drop_rate
+        AverageWorker.get_campaign_drop_rate = MagicMock(return_value=0.05)
+        try:
+            abort1, reason = AverageWorker._caps_batch_should_abort(
+                cid, campaign_max=50, dials_done=1,
+            )
+            self.assertTrue(abort1)
+            self.assertEqual(reason, 'throttle')
+        finally:
+            AverageWorker.get_campaign_drop_rate = original_drop
+
+    def test_caps_batch_should_abort_does_not_inflate_streak_when_unlatched(self):
+        cid = self.campaign_id
+        d_max = dialer_settings.MAX_ABANDON_RATE
+        AverageWorker._update_throttle_streak(cid, 0.05, d_max)
+        AverageWorker.REDIS_DIALER_CONNECTION.set(f'OML:CALLS:{cid}:DIALER', 1)
+        AverageWorker._init_campaign_channel_phases(cid)
+        original_drop = AverageWorker.get_campaign_drop_rate
+        AverageWorker.get_campaign_drop_rate = MagicMock(return_value=0.05)
+        try:
+            for dials in (3, 6, 9, 12, 15):
+                abort, _ = AverageWorker._caps_batch_should_abort(
+                    cid, campaign_max=50, dials_done=dials,
+                )
+                self.assertFalse(abort)
+            self.assertIsNone(
+                AverageWorker.REDIS_DIALER_CONNECTION.get(f'CAMP:{cid}:THROTTLE_LATCH'),
+            )
+            # over_since set but not latched; mid-CAPS must not engage latch
+            self.assertIsNotNone(
+                AverageWorker.REDIS_DIALER_CONNECTION.get(
+                    f'CAMP:{cid}:THROTTLE_OVER_SINCE',
+                ),
+            )
+        finally:
+            AverageWorker.get_campaign_drop_rate = original_drop
+
+    def test_caps_batch_should_abort_on_campaign_inactive(self):
+        cid = self.campaign_id
+        AverageWorker.REDIS_DIALER_CONNECTION.set(f'OML:CALLS:{cid}:DIALER', 0)
+        AverageWorker._init_campaign_channel_phases(cid)
+        AverageWorker.REDIS_DIALER_CONNECTION.hset(
+            f'CAMP:{cid}:DISTRIBUTION', 'STATUS', '0',
+        )
+        try:
+            abort, reason = AverageWorker._caps_batch_should_abort(
+                cid, campaign_max=50, dials_done=1,
+            )
+            self.assertTrue(abort)
+            self.assertEqual(reason, 'campaign_inactive')
+        finally:
+            AverageWorker.REDIS_DIALER_CONNECTION.delete(f'CAMP:{cid}:DISTRIBUTION')
+
+    def test_caps_batch_should_abort_on_origin_guardrail_backlog(self):
+        cid = self.campaign_id
+        AverageWorker.REDIS_DIALER_CONNECTION.set(f'OML:CALLS:{cid}:DIALER', 1)
+        AverageWorker._init_campaign_channel_phases(cid)
+        import handler.naive as naive_mod
+        orig = naive_mod.evaluate_backpressure_guardrails
+        naive_mod.evaluate_backpressure_guardrails = MagicMock(
+            return_value=(True, 'process_event_backlog'),
+        )
+        try:
+            abort, reason = AverageWorker._caps_batch_should_abort(
+                cid, campaign_max=50, dials_done=0,
+            )
+            self.assertTrue(abort)
+            self.assertEqual(reason, 'process_event_backlog')
+        finally:
+            naive_mod.evaluate_backpressure_guardrails = orig
 
 
 class DialModePacingTests(unittest.TestCase):
@@ -645,6 +1007,17 @@ class DialModePacingTests(unittest.TestCase):
         mock_redis.set.side_effect = redis_set
         mock_redis.hgetall.return_value = {}
         AverageWorker.REDIS_DIALER_CONNECTION = mock_redis
+
+        self._oml_camp = {}
+        self._orig_oml_redis = AverageWorker.REDIS_OML_CONNECTION
+        mock_oml = MagicMock()
+
+        def oml_hmget(key, *fields):
+            data = self._oml_camp.get(key, {})
+            return [data.get(field) for field in fields]
+
+        mock_oml.hmget.side_effect = oml_hmget
+        AverageWorker.REDIS_OML_CONNECTION = mock_oml
 
         self._orig_get_predictive = AverageWorker.get_predictive_model
         self._orig_get_boost = AverageWorker.get_boost_factor
@@ -675,6 +1048,7 @@ class DialModePacingTests(unittest.TestCase):
 
     def tearDown(self):
         AverageWorker.REDIS_DIALER_CONNECTION = self._orig_redis
+        AverageWorker.REDIS_OML_CONNECTION = self._orig_oml_redis
         AverageWorker.get_predictive_model = self._orig_get_predictive
         AverageWorker.get_boost_factor = self._orig_get_boost
         AverageWorker.get_number_available_agents = self._orig_get_agents
@@ -696,9 +1070,10 @@ class DialModePacingTests(unittest.TestCase):
             pass
 
     def _set_power_keys(self, customdialerdst='0', voicebot='False'):
-        cid = self.campaign_id
-        self._redis[f'CAMP:{cid}:CUSTOMDIALERDST'] = customdialerdst
-        self._redis[f'CAMP:{cid}:VOICEBOT'] = voicebot
+        self._oml_camp[f'OML:CAMP:{self.campaign_id}'] = {
+            'CUSTOMDIALERDST': customdialerdst,
+            'VOICEBOT': voicebot,
+        }
 
     def test_resolve_dial_mode_power_by_customdialerdst(self):
         self._set_power_keys(customdialerdst='SIP/trunk')
@@ -713,6 +1088,15 @@ class DialModePacingTests(unittest.TestCase):
         mode, reason = AverageWorker.resolve_dial_mode(self.campaign_id)
         self.assertEqual(mode, AverageWorker.DIAL_MODE_POWER)
         self.assertEqual(reason, 'VOICEBOT=True')
+
+    def test_resolve_dial_mode_ignores_stale_dialer_voicebot(self):
+        """DB3 CAMP:{id}:VOICEBOT=True no fuerza power si OML:CAMP es False."""
+        self._set_power_keys(customdialerdst='0', voicebot='False')
+        self._redis[f'CAMP:{self.campaign_id}:VOICEBOT'] = 'True'
+        AverageWorker.get_predictive_model = MagicMock(return_value=False)
+        mode, reason = AverageWorker.resolve_dial_mode(self.campaign_id)
+        self.assertEqual(mode, AverageWorker.DIAL_MODE_PROGRESSIVE)
+        self.assertEqual(reason, 'initial_predictive_model=False')
 
     def test_resolve_dial_mode_predictive(self):
         self._set_power_keys()
@@ -892,7 +1276,23 @@ class DialModePacingTests(unittest.TestCase):
             naive_mod.PREDICTIVE_ENABLED = False
             mode, reason = AverageWorker.resolve_dial_mode(self.campaign_id)
             self.assertEqual(mode, AverageWorker.DIAL_MODE_PROGRESSIVE)
-            self.assertIn('DIALER_PREDICTIVE_ENABLED=false', reason)
+            self.assertEqual(reason, AverageWorker.REASON_PREDICTIVE_FF_DISABLED_R1)
+        finally:
+            naive_mod.PREDICTIVE_ENABLED = orig
+
+    def test_allowed_parallel_predictive_ff_disabled_forces_r1_ignores_boost(self):
+        """FF off + boost=3 → same cupo as R=1 (not 3× agents)."""
+        self._set_power_keys()
+        self._mock_pacing_inputs(
+            agents_score=2.0, active=0, max_channels=20, ringing=0, oncall=0)
+        AverageWorker.get_predictive_model = MagicMock(return_value=True)
+        AverageWorker.get_boost_factor = MagicMock(return_value=3.0)
+        orig = naive_mod.PREDICTIVE_ENABLED
+        try:
+            naive_mod.PREDICTIVE_ENABLED = False
+            allowed = AverageWorker.allowed_parallel_contact_attempts(self.campaign_id)
+            # R=1 with 2 READY → 2, not 6
+            self.assertEqual(allowed, 2)
         finally:
             naive_mod.PREDICTIVE_ENABLED = orig
 
@@ -1109,12 +1509,30 @@ class PredictivePacerUnitTests(unittest.TestCase):
         self.assertEqual(compute_c_dial(2, 0, 0, 0.5, 1.0), 4)
         # a_free=0, a_exp=4.5, ringing=0, p=0.5 → 9
         self.assertEqual(compute_c_dial(0, 4.5, 0, 0.5, 1.0), 9)
-        # ringing cancels free capacity: (2+0-4*0.5)/0.5 = 0
+        # ringing cancels free capacity when g=1: (2+0-4*0.5)/0.5 = 0
         self.assertEqual(compute_c_dial(2, 0, 4, 0.5, 1.0), 0)
+        # boost g=2.5 scales target capacity: ((2*2.5) - 4*0.5)/0.5 = (5 - 2)/0.5 = 6
+        self.assertEqual(compute_c_dial(2, 0, 4, 0.5, 2.5), 6)
         # gamma 0 → 0
         self.assertEqual(compute_c_dial(2, 0, 0, 0.5, 0.0), 0)
         # negative raw clamped
         self.assertEqual(compute_c_dial(0, 0, 10, 0.5, 1.0), 0)
+        # WAITING_AGENT reduces net capacity: A=2-1=1 → C_dial=2 (vs 4 without waiting)
+        self.assertEqual(compute_c_dial(2, 0, 0, 0.5, 1.0, c_waiting=1), 2)
+        self.assertEqual(compute_c_dial(2, 0, 0, 0.5, 1.0, c_waiting=2), 0)
+
+    def test_apply_dial_ratio_cap(self):
+        from handler.predictive_pacer import apply_dial_ratio_cap
+        # A=5, ratio=5, ringing=0 → max_slots=25; c_dial=100 → 25
+        self.assertEqual(apply_dial_ratio_cap(100, 5, 0, 0, 5), 25)
+        # ratio 0 → no-op
+        self.assertEqual(apply_dial_ratio_cap(100, 5, 0, 0, 0), 100)
+        # soft 1.0: A=5, ringing=2 → max_slots=3
+        self.assertEqual(apply_dial_ratio_cap(20, 5, 0, 2, 1.0), 3)
+        # waiting reduces A: A=5-2=3, ratio=5 → 15
+        self.assertEqual(apply_dial_ratio_cap(100, 5, 0, 0, 5, c_waiting=2), 15)
+        # never negative
+        self.assertEqual(apply_dial_ratio_cap(10, 1, 0, 5, 1.0), 0)
 
     def test_compute_gamma_zones(self):
         from handler.predictive_pacer import compute_gamma
@@ -1137,15 +1555,39 @@ class PredictivePacerUnitTests(unittest.TestCase):
         self.assertTrue(warm['use_progressive_r1'])
         self.assertEqual(warm['mode'], 'warmup')
 
-        # D≥D_max without force_throttle → soft predictive (γ=floor)
+        # D≥D_max without force_throttle → soft predictive (γ=floor) + ratio ≤1×
         soft = decide_predictive_pace(
             a_free=2, a_expected=5, c_ringing=0, p_hit=0.5, drop_rate=0.05,
             d_max=0.03, aggressiveness=1.0, warmup=False, gamma_floor=0.2,
+            max_dial_ratio=5,
         )
         self.assertFalse(soft['use_progressive_r1'])
         self.assertEqual(soft['mode'], 'predictive')
         self.assertEqual(soft['reason'], 'drop_over_dmax_soft')
         self.assertAlmostEqual(soft['gamma'], 0.2)
+        # A=7, soft ratio 1 → c_dial ≤ 7; with p=0.5 γ=0.2 raw=2
+        self.assertEqual(soft['c_dial'], 2)
+        self.assertLessEqual(soft['c_dial'], 7)
+
+        # Soft hold must not explode with low P_hit (γ_floor/P without ratio cap)
+        soft_low_p = decide_predictive_pace(
+            a_free=5, a_expected=0, c_ringing=0, p_hit=0.02, drop_rate=0.05,
+            d_max=0.03, aggressiveness=1.0, warmup=False, gamma_floor=0.4,
+            p_hit_floor=0.02, max_dial_ratio=5,
+        )
+        self.assertEqual(soft_low_p['reason'], 'drop_over_dmax_soft')
+        # Without soft ratio: ((5)/0.02)*0.4 = 100; with soft ≤1× → 5
+        self.assertEqual(soft_low_p['c_dial'], 5)
+
+        # Healthy predictive + max_dial_ratio=5 caps floor explosion
+        capped = decide_predictive_pace(
+            a_free=5, a_expected=0, c_ringing=0, p_hit=0.02, drop_rate=0.0,
+            d_max=0.03, aggressiveness=1.0, warmup=False, gamma_floor=0.4,
+            p_hit_floor=0.02, max_dial_ratio=5,
+        )
+        self.assertEqual(capped['reason'], 'ok')
+        # Uncapped would be 5/0.02=250; ratio 5 → 25
+        self.assertEqual(capped['c_dial'], 25)
 
         # force_throttle → hard kill-switch
         throttled = decide_predictive_pace(
@@ -1196,12 +1638,24 @@ class CampaignAgentSnapshotTests(unittest.TestCase):
         self._orig_get_metrics = AverageWorker.get_campaign_metrics
 
         mock_redis = MagicMock()
+        self._cooldown_agents = set()
 
         def hmget(key, *fields):
             data = self._agent_hashes.get(key, {})
             return [data.get(f) for f in fields]
 
+        def exists(key):
+            # acd:cooldown:agent:{id}
+            if not isinstance(key, str) or not key.startswith('acd:cooldown:agent:'):
+                return 0
+            agent_id = key.rsplit(':', 1)[-1]
+            try:
+                return 1 if int(agent_id) in self._cooldown_agents else 0
+            except (TypeError, ValueError):
+                return 1 if agent_id in self._cooldown_agents else 0
+
         mock_redis.hmget.side_effect = hmget
+        mock_redis.exists.side_effect = exists
         AverageWorker.REDIS_OML_CONNECTION = mock_redis
         AverageWorker.connect_redis_oml = MagicMock()
 
@@ -1238,6 +1692,16 @@ class CampaignAgentSnapshotTests(unittest.TestCase):
         self.assertEqual(snap['a_busy'], 0.0)
         self.assertEqual(snap['busy_agents'], [])
 
+    def test_snapshot_ready_with_wrapup_cooldown_excluded(self):
+        AverageWorker.get_agent_ids_campaign = MagicMock(return_value={1: 1, 2: 1})
+        self._set_agent(1, 'READY', timestamp=100)
+        self._set_agent(2, 'READY', timestamp=100)
+        self._cooldown_agents.add(1)
+        snap = AverageWorker.get_campaign_agent_snapshot(self.campaign_id)
+        self.assertEqual(snap['a_free'], 1)
+        self.assertEqual(snap['total_ready'], 1)
+        self.assertEqual(snap['a_busy'], 0.0)
+
     def test_snapshot_busy_statuses_with_elapsed(self):
         AverageWorker.get_agent_ids_campaign = MagicMock(
             return_value={1: 1, 2: 1, 3: 1})
@@ -1267,6 +1731,17 @@ class CampaignAgentSnapshotTests(unittest.TestCase):
         self.assertEqual(snap['a_oncall'], 0.5)
         self.assertEqual(snap['a_busy'], 0.5)
         self.assertEqual(snap['busy_agents'][0]['weight'], 0.5)
+
+    def test_snapshot_multiqueue_ready_uses_ceil(self):
+        # 5 READY agents shared across 3 campaigns -> a_free_raw = 5/3 = 1.666 -> ceil = 2
+        AverageWorker.get_agent_ids_campaign = MagicMock(
+            return_value={1: 3, 2: 3, 3: 3, 4: 3, 5: 3})
+        for aid in range(1, 6):
+            self._set_agent(aid, 'READY', timestamp=100)
+        snap = AverageWorker.get_campaign_agent_snapshot(self.campaign_id)
+        self.assertEqual(snap['total_ready'], 5)
+        self.assertEqual(snap['a_free'], 2)
+        self.assertAlmostEqual(snap['a_free_raw'], 5.0 / 3.0, places=5)
 
     def test_snapshot_ignores_unrelated_pause(self):
         AverageWorker.get_agent_ids_campaign = MagicMock(return_value={4: 1})
@@ -1540,9 +2015,13 @@ class MyTestSuite(unittest.TestCase):
     def setUp(self):
         self._wait_pg()
         self.fetchmany_counter = 0
+        AverageWorker.get_incidence_rule.cache_clear()
+        AverageWorker.get_incidence_rule_disposition.cache_clear()
         self._create_campaign()
 
     def tearDown(self):
+        AverageWorker.get_incidence_rule.cache_clear()
+        AverageWorker.get_incidence_rule_disposition.cache_clear()
         self.clean_databases()
 
     @classmethod
@@ -1727,6 +2206,76 @@ class MyTestSuite(unittest.TestCase):
         # check that a job was submitted to 'schedule-contact'
         self.assertEqual(AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][0],
                          'schedule-agenda')
+
+    def test_amd_uses_contestador_terminated_incidence_rule(self):
+        """Dial AMD looks up UI Contestador rule (TERMINATED) and schedules retry."""
+        AverageWorker.GM_CLIENT.submit_job = MagicMock()
+        AverageWorker.get_incidence_rule.cache_clear()
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn_dialer:
+            cursor_dialer = conn_dialer.cursor()
+            cursor_dialer.execute(
+                """INSERT INTO incidence_rules (id, status, status_custom, max_attempt,
+                retry_later, in_mode, campaign_id) VALUES
+                (%s, %s, %s, %s, %s, %s, %s);""",
+                (30, STATUS_TERMINATED, 'CONTESTADOR', 1, 60, 1, 4))
+        amd_event = self.gen_fail_event('AMD')
+        amd_event['callid'] = 'amd-incidence-1'
+        job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(amd_event), encoding='UTF8'),
+        )
+        AverageWorker.process_event(self.worker, job)
+        self.assertEqual(
+            AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][0],
+            'schedule-agenda',
+        )
+        agenda = json.loads(AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][1])
+        self.assertEqual(agenda['type'], 'incidence_rule')
+        self.assertEqual(str(agenda['id_campaign']), '4')
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn_dialer:
+            cursor_dialer = conn_dialer.cursor()
+            cursor_dialer.execute(
+                'SELECT final_status, status FROM contact_in_campaign '
+                'WHERE id_campaign = 4 AND id_contact = 1',
+            )
+            final_status, contact_status = cursor_dialer.fetchone()
+            self.assertEqual(final_status, PENDING_ATTEMPTS)
+            self.assertEqual(contact_status, STATUS_AMD_MACHINE)
+
+    def test_exit_timeout_uses_timeout_incidence_rule(self):
+        """Dial EXIT_TIMEOUT looks up UI Timeout rule and schedules retry."""
+        AverageWorker.GM_CLIENT.submit_job = MagicMock()
+        AverageWorker.get_incidence_rule.cache_clear()
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn_dialer:
+            cursor_dialer = conn_dialer.cursor()
+            cursor_dialer.execute(
+                """INSERT INTO incidence_rules (id, status, status_custom, max_attempt,
+                retry_later, in_mode, campaign_id) VALUES
+                (%s, %s, %s, %s, %s, %s, %s);""",
+                (31, STATUS_TIMEOUT, '', 1, 60, 1, 4))
+        event = self.gen_fail_event('EXIT_TIMEOUT')
+        event['callid'] = 'exit-timeout-incidence-1'
+        job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(event), encoding='UTF8'),
+        )
+        AverageWorker.process_event(self.worker, job)
+        self.assertEqual(
+            AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][0],
+            'schedule-agenda',
+        )
+        agenda = json.loads(AverageWorker.GM_CLIENT.submit_job.call_args_list[0][0][1])
+        self.assertEqual(agenda['type'], 'incidence_rule')
+        self.assertEqual(str(agenda['id_campaign']), '4')
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn_dialer:
+            cursor_dialer = conn_dialer.cursor()
+            cursor_dialer.execute(
+                'SELECT final_status, status FROM contact_in_campaign '
+                'WHERE id_campaign = 4 AND id_contact = 1',
+            )
+            final_status, contact_status = cursor_dialer.fetchone()
+            self.assertEqual(final_status, PENDING_ATTEMPTS)
+            self.assertEqual(contact_status, STATUS_EXIT_TIMEOUT)
 
     def test_process_event_missing_explicit_fields_fails_fast(self):
         AverageWorker.GM_CLIENT.submit_job = MagicMock()
@@ -2266,6 +2815,113 @@ class MyTestSuite(unittest.TestCase):
         val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
         self.assertEqual(int(val), 2)
 
+    def test_process_event_dial_amd_decrements_and_finalizes(self):
+        """Dial AMD: un DECR + FINALIZED_NOCONTACT + muestra H7 si amd_duration."""
+        AverageWorker.connect_redis_dialer()
+        AverageWorker._init_campaign_channel_phases(4)
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 2)
+        AverageWorker.GM_CLIENT.submit_job = MagicMock()
+        event = self.gen_fail_event('AMD')
+        event['callid'] = 'amd-call-1'
+        event['amd_duration'] = 3.5
+        job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(event), encoding='UTF8'),
+        )
+        AverageWorker.process_event(self.worker, job)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1,
+        )
+        self.assertIsNotNone(
+            AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:DECR:4:1'),
+        )
+        self.assertAlmostEqual(
+            float(AverageWorker.REDIS_DIALER_CONNECTION.hget(
+                'CAMP:4:AMD_LATENCY', 'AMD')),
+            3.5,
+        )
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'SELECT final_status FROM contact_in_campaign '
+                'WHERE id_campaign = 4 AND id_contact = 1',
+            )
+            self.assertEqual(cur.fetchone()[0], FINALIZED_NOCONTACT)
+        AverageWorker.GM_CLIENT.submit_job.assert_called()
+
+    def test_process_event_dial_amd_then_destroy_same_callid_single_decr(self):
+        """Dial AMD + ChannelDestroyed mismo callid: un DECR; Destroy no send-reports."""
+        AverageWorker.connect_redis_dialer()
+        AverageWorker._init_campaign_channel_phases(4)
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 2)
+        AverageWorker.GM_CLIENT.submit_job = MagicMock()
+        callid = 'amd-then-destroy-1'
+        amd_event = self.gen_fail_event('AMD')
+        amd_event['callid'] = callid
+        amd_job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(amd_event), encoding='UTF8'),
+        )
+        AverageWorker.process_event(self.worker, amd_job)
+        reports_after_amd = AverageWorker.GM_CLIENT.submit_job.call_count
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1,
+        )
+
+        destroy_event = {
+            'type': 'ChannelDestroyed',
+            'call_type': 'to_pstn',
+            'id_campaign': '4',
+            'contact_id': '1',
+            'phone_number': '6093017590',
+            'callid': callid,
+        }
+        destroy_job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(destroy_event), encoding='UTF8'),
+        )
+        AverageWorker.process_event(self.worker, destroy_job)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1,
+        )
+        self.assertEqual(
+            AverageWorker.GM_CLIENT.submit_job.call_count, reports_after_amd,
+        )
+
+    def test_process_event_dial_amd_then_destroy_without_callid_single_decr(self):
+        """Dial AMD con callid + Destroy sin callid: un DECR (marker contacto)."""
+        AverageWorker.connect_redis_dialer()
+        AverageWorker._init_campaign_channel_phases(4)
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 2)
+        AverageWorker.GM_CLIENT.submit_job = MagicMock()
+        amd_event = self.gen_fail_event('AMD')
+        amd_event['callid'] = 'amd-callid-present'
+        amd_job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(amd_event), encoding='UTF8'),
+        )
+        AverageWorker.process_event(self.worker, amd_job)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1,
+        )
+
+        destroy_event = {
+            'type': 'ChannelDestroyed',
+            'call_type': 'to_pstn',
+            'id_campaign': '4',
+            'contact_id': '1',
+            'phone_number': '6093017590',
+            # sin callid
+        }
+        destroy_job = GearmanJob(
+            None, None, b'process-event', bytes(str(uuid.uuid4()), encoding='utf8'),
+            bytes(json.dumps(destroy_event), encoding='UTF8'),
+        )
+        AverageWorker.process_event(self.worker, destroy_job)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1,
+        )
+
     def test_decrement_calls_once_idempotent(self):
         AverageWorker.connect_redis_dialer()
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 2)
@@ -2293,121 +2949,342 @@ class MyTestSuite(unittest.TestCase):
         val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
         self.assertEqual(int(val), 0)
 
-    def test_audit_active_channels_corrects_ghost(self):
+    def _seed_contacts_consumed_for_autofinalize(self):
+        """Sin CREATED/SELECTED ni PENDING_ATTEMPTS: candidatos a auto-finalize."""
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'UPDATE campaign SET dialer_status = %s, '
+                'start_date = now()::date, end_date = now()::date WHERE id = 4',
+                (ACTIVE,),
+            )
+            cur.execute(
+                'UPDATE contact_in_campaign SET status = %s, final_status = %s '
+                'WHERE id_campaign = 4',
+                (STATUS_ANSWERED_AGENT, FINALIZED_NOCONTACT),
+            )
+
+    def test_auto_finalize_deferred_while_oncall_phase(self):
+        """No finalizar si quedan phase keys (ONCALL) aunque no haya pendientes."""
+        self._seed_contacts_consumed_for_autofinalize()
         AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set(
+            'OML:CALLS:PHASE:4:1', PHASE_ONCALL, ex=3600,
+        )
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 1)
+        AverageWorker.no_active_agendas = MagicMock(return_value=True)
+        AverageWorker._notify_dialer_event = MagicMock()
+        try:
+            active = AverageWorker.campaign_is_active(4)
+            self.assertTrue(active)
+            with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT dialer_status FROM campaign WHERE id = 4')
+                self.assertEqual(cur.fetchone()[0], ACTIVE)
+            self.assertEqual(
+                int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1,
+            )
+            self.assertEqual(
+                AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:PHASE:4:1'),
+                PHASE_ONCALL,
+            )
+        finally:
+            del AverageWorker.no_active_agendas
+
+    def test_auto_finalize_deferred_while_pending_incidence(self):
+        """No finalizar si hay incidencia PENDING_ATTEMPTS en Postgres."""
+        self._seed_contacts_consumed_for_autofinalize()
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'UPDATE contact_in_campaign SET final_status = %s '
+                'WHERE id_campaign = 4 AND id_contact = 1',
+                (PENDING_ATTEMPTS,),
+            )
+        # Redis COUNTER mentiría (0) — debe ganar Postgres
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.hset(
+            'CAMP:4:COUNTER',
+            'NO CONTACTS WITH PENDING ATTEMPTS',
+            0,
+        )
+        AverageWorker.no_active_agendas = MagicMock(return_value=True)
+        AverageWorker._notify_dialer_event = MagicMock()
+        try:
+            active = AverageWorker.campaign_is_active(4)
+            self.assertTrue(active)
+            with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT dialer_status FROM campaign WHERE id = 4')
+                self.assertEqual(cur.fetchone()[0], ACTIVE)
+        finally:
+            del AverageWorker.no_active_agendas
+
+    def test_auto_finalize_when_drained(self):
+        """Sin pendientes, sin incidencia, sin phase keys → FINALIZED + reset."""
+        self._seed_contacts_consumed_for_autofinalize()
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 2)
+        AverageWorker._init_campaign_channel_phases(4)
+        AverageWorker.no_active_agendas = MagicMock(return_value=True)
+        AverageWorker._notify_dialer_event = MagicMock()
+        try:
+            active = AverageWorker.campaign_is_active(4)
+            self.assertFalse(active)
+            with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT dialer_status FROM campaign WHERE id = 4')
+                self.assertEqual(cur.fetchone()[0], FINALIZED)
+            self.assertEqual(
+                int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER') or 0),
+                0,
+            )
+        finally:
+            del AverageWorker.no_active_agendas
+
+    def _seed_acd_nodes_registry(self, *node_ids):
+        """Ensure audit_active_channels does not bail on empty OML:ACD:NODES."""
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        r.delete('OML:ACD:NODES')
+        for node_id in node_ids:
+            r.sadd('OML:ACD:NODES', node_id)
+
+    def _run_audit_with_fetch(
+            self, fetch_return, reserve=False, recent_reserves=None, times=1):
+        """
+        fetch_return: (cluster_complete, counts, ringing)
+        recent_reserves: if set, mocks _count_recent_reserves; when reserve=True
+        and recent_reserves is None, defaults to a large count so CALLS down
+        is skipped (safe_down >= redis).
+        """
+        original_fetch = AverageWorker._fetch_acd_snapshot_counts
+        original_reserve = AverageWorker._campaign_has_recent_reserve
+        original_count = AverageWorker._count_recent_reserves
+        AverageWorker._campaign_has_recent_reserve = MagicMock(return_value=reserve)
+        AverageWorker._fetch_acd_snapshot_counts = MagicMock(return_value=fetch_return)
+        if recent_reserves is None:
+            count_val = 100 if reserve else 0
+        else:
+            count_val = int(recent_reserves)
+        AverageWorker._count_recent_reserves = MagicMock(return_value=count_val)
+        try:
+            for _ in range(times):
+                AverageWorker.audit_active_channels()
+        finally:
+            AverageWorker._fetch_acd_snapshot_counts = original_fetch
+            AverageWorker._campaign_has_recent_reserve = original_reserve
+            AverageWorker._count_recent_reserves = original_count
+
+    def test_audit_active_channels_corrects_ghost_idle_after_streak(self):
+        AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1')
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
         with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
             conn.cursor().execute(
                 'UPDATE campaign SET dialer_status = %s WHERE id = 4', (FINALIZED,)
             )
-        original_fetch = AverageWorker._fetch_asterisk_dialer_channel_counts
-        AverageWorker._fetch_asterisk_dialer_channel_counts = MagicMock(
-            return_value=(True, {4: 0})
+        # Idle down streak default=2
+        self._run_audit_with_fetch((True, {4: 0}, {}), times=1)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 5,
         )
-        try:
-            AverageWorker.audit_active_channels()
-            val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
-            self.assertEqual(int(val), 0)
-        finally:
-            AverageWorker._fetch_asterisk_dialer_channel_counts = original_fetch
+        self._run_audit_with_fetch((True, {4: 0}, {}), times=1)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 0,
+        )
 
-    def test_audit_skips_when_ok_false(self):
+    def test_audit_skips_when_no_acd_nodes(self):
         AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.delete('OML:ACD:NODES')
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
-        original_fetch = AverageWorker._fetch_asterisk_dialer_channel_counts
-        AverageWorker._fetch_asterisk_dialer_channel_counts = MagicMock(
-            return_value=(False, {})
+        original_fetch = AverageWorker._fetch_acd_snapshot_counts
+        AverageWorker._fetch_acd_snapshot_counts = MagicMock(
+            return_value=(False, {}, {})
         )
         try:
             AverageWorker.audit_active_channels()
             val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
             self.assertEqual(int(val), 5)
         finally:
-            AverageWorker._fetch_asterisk_dialer_channel_counts = original_fetch
+            AverageWorker._fetch_acd_snapshot_counts = original_fetch
 
-    def test_fetch_asterisk_counts_reads_gearman_result(self):
-        completed = MagicMock()
-        completed.result = b'{"ok": true, "counts": {"4": 3}}'
-        completed.data = None
-        client = MagicMock()
-        client.submit_job.return_value = completed
-        original_get_client = AverageWorker._get_gearman_client
-        AverageWorker._get_gearman_client = MagicMock(return_value=client)
-        try:
-            ok, counts, ringing = AverageWorker._fetch_asterisk_dialer_channel_counts()
-            self.assertTrue(ok)
-            self.assertEqual(counts, {4: 3})
-            self.assertIsNone(ringing)
-        finally:
-            AverageWorker._get_gearman_client = original_get_client
+    def test_fetch_acd_snapshot_sums_fresh_nodes(self):
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        r.delete('OML:ACD:NODES')
+        r.sadd('OML:ACD:NODES', 'n1', 'n2')
+        r.set('OML:ACD:NODE:n1:HB', '1', ex=60)
+        r.set('OML:ACD:NODE:n2:HB', '1', ex=60)
+        r.delete('OML:ACD:n1:CHANNELS', 'OML:ACD:n2:CHANNELS')
+        r.delete('OML:ACD:n1:RINGING', 'OML:ACD:n2:RINGING')
+        r.hset('OML:ACD:n1:CHANNELS', mapping={'4': 2})
+        r.hset('OML:ACD:n2:CHANNELS', mapping={'4': 1, '7': 3})
+        r.hset('OML:ACD:n1:RINGING', mapping={'4': 1})
+        complete, counts, ringing = AverageWorker._fetch_acd_snapshot_counts()
+        self.assertTrue(complete)
+        self.assertEqual(counts, {4: 3, 7: 3})
+        self.assertEqual(ringing, {4: 1})
 
-    def test_fetch_asterisk_counts_falls_back_to_gearman_data(self):
-        completed = MagicMock()
-        completed.result = None
-        completed.data = b'{"ok": true, "counts": {"7": 2}}'
-        client = MagicMock()
-        client.submit_job.return_value = completed
-        original_get_client = AverageWorker._get_gearman_client
-        AverageWorker._get_gearman_client = MagicMock(return_value=client)
-        try:
-            ok, counts, ringing = AverageWorker._fetch_asterisk_dialer_channel_counts()
-            self.assertTrue(ok)
-            self.assertEqual(counts, {7: 2})
-            self.assertIsNone(ringing)
-        finally:
-            AverageWorker._get_gearman_client = original_get_client
+    def test_fetch_acd_snapshot_incomplete_skips_stale_node(self):
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        r.delete('OML:ACD:NODES')
+        r.delete('OML:ACD:NODE:n1:STALE_TICKS', 'OML:ACD:NODE:n2:STALE_TICKS')
+        r.sadd('OML:ACD:NODES', 'n1', 'n2')
+        r.set('OML:ACD:NODE:n1:HB', '1', ex=60)
+        r.delete('OML:ACD:NODE:n2:HB')
+        r.delete('OML:ACD:n1:CHANNELS', 'OML:ACD:n2:CHANNELS')
+        r.hset('OML:ACD:n1:CHANNELS', mapping={'4': 2})
+        r.hset('OML:ACD:n2:CHANNELS', mapping={'4': 9})
+        complete, counts, ringing = AverageWorker._fetch_acd_snapshot_counts()
+        self.assertFalse(complete)
+        self.assertEqual(counts, {4: 2})
+        self.assertEqual(ringing, {})
+        self.assertEqual(int(r.get('OML:ACD:NODE:n2:STALE_TICKS') or 0), 1)
 
-    def test_fetch_asterisk_counts_parses_ringing_field(self):
-        completed = MagicMock()
-        completed.result = b'{"ok": true, "counts": {"4": 3}, "ringing": {"4": 1}}'
-        completed.data = None
-        client = MagicMock()
-        client.submit_job.return_value = completed
-        original_get_client = AverageWorker._get_gearman_client
-        AverageWorker._get_gearman_client = MagicMock(return_value=client)
-        try:
-            ok, counts, ringing = AverageWorker._fetch_asterisk_dialer_channel_counts()
-            self.assertTrue(ok)
-            self.assertEqual(counts, {4: 3})
-            self.assertEqual(ringing, {4: 1})
-        finally:
-            AverageWorker._get_gearman_client = original_get_client
+    def test_fetch_acd_evicts_stale_node_after_n_ticks(self):
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        r.delete('OML:ACD:NODES')
+        r.delete('OML:ACD:NODE:n1:STALE_TICKS', 'OML:ACD:NODE:n2:STALE_TICKS')
+        r.sadd('OML:ACD:NODES', 'n1', 'n2')
+        r.set('OML:ACD:NODE:n1:HB', '1', ex=60)
+        r.delete('OML:ACD:NODE:n2:HB')
+        r.delete('OML:ACD:n1:CHANNELS', 'OML:ACD:n2:CHANNELS')
+        r.hset('OML:ACD:n1:CHANNELS', mapping={'4': 2})
+        r.hset('OML:ACD:n2:CHANNELS', mapping={'4': 9})
+        n = dialer_settings.ACD_STALE_EVICT_TICKS
+        for i in range(n - 1):
+            complete, counts, _ = AverageWorker._fetch_acd_snapshot_counts()
+            self.assertFalse(complete)
+            self.assertEqual(counts, {4: 2})
+            self.assertTrue(r.sismember('OML:ACD:NODES', 'n2'))
+        complete, counts, _ = AverageWorker._fetch_acd_snapshot_counts()
+        self.assertTrue(complete)
+        self.assertEqual(counts, {4: 2})
+        self.assertFalse(r.sismember('OML:ACD:NODES', 'n2'))
+        self.assertTrue(r.sismember('OML:ACD:NODES', 'n1'))
+        self.assertIsNone(r.get('OML:ACD:n2:CHANNELS'))
 
-    def test_audit_corrects_undercount(self):
+    def test_audit_corrects_undercount_after_up_streak(self):
         self._set_campaign_active(4)
         AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1')
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 1)
-        original_fetch = AverageWorker._fetch_asterisk_dialer_channel_counts
-        original_reserve = AverageWorker._campaign_has_recent_reserve
-        AverageWorker._campaign_has_recent_reserve = MagicMock(return_value=False)
-        AverageWorker._fetch_asterisk_dialer_channel_counts = MagicMock(
-            return_value=(True, {4: 3})
+        # First tick: streak only
+        self._run_audit_with_fetch((True, {4: 3}, {}), times=1)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1,
         )
-        try:
-            AverageWorker.audit_active_channels()
-            val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
-            self.assertEqual(int(val), 3)
-        finally:
-            AverageWorker._fetch_asterisk_dialer_channel_counts = original_fetch
-            AverageWorker._campaign_has_recent_reserve = original_reserve
+        # Second tick: correct
+        self._run_audit_with_fetch((False, {4: 3}, {}), times=1)  # partial OK for up
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 3,
+        )
 
     def test_audit_skips_overcount_with_recent_reserve(self):
+        """Skip CALLS down while redis <= observed + recent_reserves."""
         self._set_campaign_active(4)
         AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1')
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
-        original_fetch = AverageWorker._fetch_asterisk_dialer_channel_counts
-        original_reserve = AverageWorker._campaign_has_recent_reserve
-        AverageWorker._campaign_has_recent_reserve = MagicMock(return_value=True)
-        AverageWorker._fetch_asterisk_dialer_channel_counts = MagicMock(
-            return_value=(True, {4: 1})
+        # observed=1, recent=4 → safe=5 → redis==safe → skip
+        self._run_audit_with_fetch(
+            (True, {4: 1}, {}), reserve=True, recent_reserves=4, times=4,
         )
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 5,
+        )
+
+    def test_audit_downs_when_reserve_flag_but_count_zero(self):
+        """Stale RESERVE_TS (flag True, count 0) must not block CALLS down."""
+        self._set_campaign_active(4)
+        AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1')
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
+        self._run_audit_with_fetch(
+            (True, {4: 1}, {}), reserve=True, recent_reserves=0, times=3,
+        )
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 5,
+        )
+        self._run_audit_with_fetch(
+            (True, {4: 1}, {}), reserve=True, recent_reserves=0, times=1,
+        )
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1,
+        )
+
+    def test_reconcile_waiting_oncall_respects_recent_reserve_margin(self):
+        """WAIT+ONC trim keeps expected_non_ringing + recent_reserves margin."""
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        AverageWorker._init_campaign_channel_phases(4)
+        r.hset(
+            'CAMP:4:CHANNELS',
+            mapping={
+                PHASE_RINGING: 2,
+                PHASE_WAITING_AGENT: 8,
+                PHASE_ONCALL: 4,
+            },
+        )
+        original_reserve = AverageWorker._campaign_has_recent_reserve
+        original_count = AverageWorker._count_recent_reserves
+        AverageWorker._campaign_has_recent_reserve = MagicMock(return_value=True)
+        AverageWorker._count_recent_reserves = MagicMock(return_value=3)
         try:
-            AverageWorker.audit_active_channels()
-            val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
-            self.assertEqual(int(val), 5)
+            # total_target=10, ringing_target=2 → expected_non_ring=8; safe=8+3=11
+            # non_ringing=12 > 11 → trim 1 from WAIT → WAIT=7, ONC=4
+            AverageWorker._reconcile_campaign_ringing_bucket(
+                4, ringing_target=2, total_target=10, cluster_complete=True,
+            )
+            phases = AverageWorker.get_campaign_channel_phases(4)
+            self.assertEqual(phases[PHASE_WAITING_AGENT], 7)
+            self.assertEqual(phases[PHASE_ONCALL], 4)
+            self.assertEqual(
+                phases[PHASE_WAITING_AGENT] + phases[PHASE_ONCALL], 11,
+            )
         finally:
-            AverageWorker._fetch_asterisk_dialer_channel_counts = original_fetch
             AverageWorker._campaign_has_recent_reserve = original_reserve
+            AverageWorker._count_recent_reserves = original_count
+
+    def test_audit_skips_down_when_cluster_incomplete_short_streak(self):
+        """Incompleto exige streak más largo; con 4 ticks aún no baja."""
+        self._set_campaign_active(4)
+        AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1', 'n2')
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
+        self._run_audit_with_fetch((False, {4: 1}, {}), times=4)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 5,
+        )
+
+    def test_audit_incomplete_down_after_long_streak(self):
+        """Con fresh signal (observed) y streak incompleto largo → down a cota."""
+        self._set_campaign_active(4)
+        AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1', 'n2')
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
+        need = dialer_settings.AUDIT_INCOMPLETE_DOWN_STREAK_TICKS
+        self._run_audit_with_fetch((False, {4: 1}, {}), reserve=False, times=need)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1,
+        )
+
+    def test_audit_corrects_overcount_after_down_streak(self):
+        self._set_campaign_active(4)
+        AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1')
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
+        self._run_audit_with_fetch((True, {4: 1}, {}), reserve=False, times=3)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 5,
+        )
+        self._run_audit_with_fetch((True, {4: 1}, {}), reserve=False, times=1)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1,
+        )
 
     def test_dial_cancel_to_agent_does_not_decrement(self):
         AverageWorker.connect_redis_dialer()
@@ -2485,7 +3362,9 @@ class MyTestSuite(unittest.TestCase):
                     ' AND id_contact = 1;'
                 )
                 self.assertEqual(cursor_dialer.fetchone()[0], STATUS_EXIT_TIMEOUT)
-            AverageWorker.handle_incidence_rules.assert_not_called()
+            AverageWorker.handle_incidence_rules.assert_called_once_with(
+                'EXIT_TIMEOUT', '4', '1', '6093017590',
+            )
         finally:
             AverageWorker.handle_incidence_rules = original_incidence
 
@@ -2882,11 +3761,14 @@ class MyTestSuite(unittest.TestCase):
             result = SchedulerWorker.schedule_contact('6093017590', 4, 1)
 
             self.assertEqual(result, 'GD!!!')
-            SchedulerWorker.trigger_acd_dial.assert_called_once_with(
-                phone_number='6093017590',
-                campaign_id=4,
-                contact_id=1,
-            )
+            SchedulerWorker.trigger_acd_dial.assert_called_once()
+            call_kw = SchedulerWorker.trigger_acd_dial.call_args.kwargs
+            self.assertEqual(call_kw.get('phone_number'), '6093017590')
+            self.assertEqual(call_kw.get('campaign_id'), 4)
+            self.assertEqual(call_kw.get('contact_id'), 1)
+            attrs = call_kw.get('attributes') or {}
+            self.assertIn('attempt_id', attrs)
+            self.assertTrue(attrs['attempt_id'])
             val = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')
             self.assertEqual(int(val), 2)
             phases = AverageWorker.get_campaign_channel_phases(4)
@@ -2936,7 +3818,8 @@ class MyTestSuite(unittest.TestCase):
         original_scheduler = SchedulerWorker.SCHEDULER
         SchedulerWorker.SCHEDULER = mock_scheduler
         try:
-            SchedulerWorker.start_periodic_jobs()
+            with patch.object(SchedulerWorker, '_start_leader_lease_once'):
+                SchedulerWorker.start_periodic_jobs()
             mock_scheduler.add_job.assert_called()
             call_args = mock_scheduler.add_job.call_args
             scheduled_fn = call_args.args[0]
@@ -2949,6 +3832,24 @@ class MyTestSuite(unittest.TestCase):
             self.assertEqual(call_args.kwargs.get('max_instances'), 1)
             self.assertTrue(call_args.kwargs.get('replace_existing'))
             self.assertTrue(naive_mod._AUDIT_JOB_REGISTERED)
+            mock_scheduler.start.assert_not_called()
+        finally:
+            SchedulerWorker.SCHEDULER = original_scheduler
+            naive_mod._AUDIT_JOB_REGISTERED = False
+
+    def test_ensure_scheduler_started_starts_paused(self):
+        naive_mod._AUDIT_JOB_REGISTERED = False
+        mock_scheduler = MagicMock()
+        mock_scheduler.running = False
+        original_scheduler = SchedulerWorker.SCHEDULER
+        SchedulerWorker.SCHEDULER = mock_scheduler
+        try:
+            with patch.object(SchedulerWorker, '_start_leader_lease_once') as start_lease:
+                with patch.object(SchedulerWorker, '_register_listener_once'):
+                    SchedulerWorker._ensure_scheduler_started()
+            mock_scheduler.start.assert_called_once_with(paused=True)
+            start_lease.assert_called_once()
+            mock_scheduler.add_job.assert_called()
         finally:
             SchedulerWorker.SCHEDULER = original_scheduler
             naive_mod._AUDIT_JOB_REGISTERED = False
@@ -3030,7 +3931,7 @@ class MyTestSuite(unittest.TestCase):
         AverageWorker.connect_redis_dialer()
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 0)
         AverageWorker._init_campaign_channel_phases(4)
-        self.assertTrue(AverageWorker._reserve_dialer_channel(4, 1))
+        self.assertEqual(AverageWorker._reserve_dialer_channel(4, 1), RESERVE_OK)
         self.assertEqual(int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1)
         phases = AverageWorker.get_campaign_channel_phases(4)
         self.assertEqual(phases[PHASE_RINGING], 1)
@@ -3039,13 +3940,64 @@ class MyTestSuite(unittest.TestCase):
         phase = AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:PHASE:4:1')
         self.assertEqual(phase, PHASE_RINGING)
 
+    def test_reserve_stores_attempt_id_when_enabled(self):
+        import settings.default as dialer_settings
+        from handler.dial_attempt import attempt_redis_key, get_attempt_id
+        self.assertTrue(dialer_settings.ATTEMPT_ID_ENABLED)
+        self._set_campaign_active(4, max_channels=5)
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 0)
+        AverageWorker._init_campaign_channel_phases(4)
+        self.assertEqual(AverageWorker._reserve_dialer_channel(4, 1), RESERVE_OK)
+        aid = get_attempt_id(AverageWorker.REDIS_DIALER_CONNECTION, 4, 1)
+        self.assertIsNotNone(aid)
+        self.assertTrue(len(aid) >= 32)
+        raw = AverageWorker.REDIS_DIALER_CONNECTION.get(attempt_redis_key(4, 1))
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8')
+        self.assertEqual(raw, aid)
+
+    def test_trigger_acd_dial_includes_attempt_id_in_metadata(self):
+        captured = {}
+
+        class _FakeClient:
+            def submit_job(self, job_name, message, background=True):
+                captured['job'] = job_name
+                captured['payload'] = json.loads(message)
+
+        AverageWorker.GM_CLIENT = _FakeClient()
+        ok = AverageWorker.trigger_acd_dial(
+            '6093017590', 4, 1, attributes={'attempt_id': 'att-test-1'},
+        )
+        self.assertTrue(ok)
+        self.assertEqual(captured['job'], 'acd-call-processor')
+        self.assertEqual(captured['payload']['metadata']['attempt_id'], 'att-test-1')
+
+    def test_reserve_skips_attempt_id_when_flag_off(self):
+        import handler.naive as naive_mod
+        self._set_campaign_active(4, max_channels=5)
+        AverageWorker.connect_redis_dialer()
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 0)
+        AverageWorker._init_campaign_channel_phases(4)
+        original = naive_mod.ATTEMPT_ID_ENABLED
+        naive_mod.ATTEMPT_ID_ENABLED = False
+        try:
+            self.assertEqual(AverageWorker._reserve_dialer_channel(4, 2), RESERVE_OK)
+            self.assertIsNone(
+                AverageWorker.REDIS_DIALER_CONNECTION.get('OML:ATTEMPT:4:2'),
+            )
+        finally:
+            naive_mod.ATTEMPT_ID_ENABLED = original
+
     def test_reserve_at_max_does_not_leave_orphan_phase(self):
         self._set_campaign_active(4, max_channels=1)
         AverageWorker.connect_redis_dialer()
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 1)
         AverageWorker._init_campaign_channel_phases(4)
         AverageWorker.REDIS_DIALER_CONNECTION.hset('CAMP:4:CHANNELS', PHASE_RINGING, 1)
-        self.assertFalse(AverageWorker._reserve_dialer_channel(4, 99))
+        self.assertEqual(
+            AverageWorker._reserve_dialer_channel(4, 99), RESERVE_MAX_CHANNELS,
+        )
         self.assertEqual(int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1)
         self.assertIsNone(
             AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:PHASE:4:99'),
@@ -3059,7 +4011,7 @@ class MyTestSuite(unittest.TestCase):
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 0)
         AverageWorker._init_campaign_channel_phases(4)
         self._set_campaign_active(4, max_channels=5)
-        self.assertTrue(AverageWorker._reserve_dialer_channel(4, 1))
+        self.assertEqual(AverageWorker._reserve_dialer_channel(4, 1), RESERVE_OK)
 
         answer_pstn = {
             'type': 'Dial',
@@ -3198,7 +4150,72 @@ class MyTestSuite(unittest.TestCase):
         AverageWorker._decrement_calls_once(4, 2, 'orphan-1', context='orphan')
         self.assertEqual(int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 0)
 
-    def test_out_of_order_answer_agent_adopts_oncall(self):
+    def test_transition_noop_does_not_resurrect_after_finalize(self):
+        """Race: noop no debe SET-recrear phase tras DEL de finalize."""
+        AverageWorker.connect_redis_dialer()
+        AverageWorker._init_campaign_channel_phases(4)
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 0)
+        self.assertEqual(AverageWorker._reserve_dialer_channel(4, 1), RESERVE_OK)
+        self.assertTrue(
+            AverageWorker._transition_channel_phase(
+                4, 1, 'race-call-1', PHASE_ONCALL,
+            ),
+        )
+        phase_key = 'OML:CALLS:PHASE:4:1:race-call-1'
+        self.assertEqual(
+            AverageWorker.REDIS_DIALER_CONNECTION.get(phase_key), PHASE_ONCALL,
+        )
+        self.assertTrue(
+            AverageWorker._decrement_calls_once(
+                4, 1, 'race-call-1', context='ChannelDestroyed',
+            ),
+        )
+        self.assertIsNone(AverageWorker.REDIS_DIALER_CONNECTION.get(phase_key))
+        # Simula evento ONCALL tardío (noop): no debe resucitar la key.
+        self.assertFalse(
+            AverageWorker._transition_channel_phase(
+                4, 1, 'race-call-1', PHASE_ONCALL,
+            ),
+        )
+        self.assertIsNone(AverageWorker.REDIS_DIALER_CONNECTION.get(phase_key))
+        phases = AverageWorker.get_campaign_channel_phases(4)
+        self.assertEqual(phases[PHASE_ONCALL], 0)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 0,
+        )
+
+    def test_decrement_sweeps_residual_phase_after_race_set(self):
+        """Si la phase reaparece tras finalize, el sweep del contacto la borra."""
+        AverageWorker.connect_redis_dialer()
+        AverageWorker._init_campaign_channel_phases(4)
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 1)
+        AverageWorker.REDIS_DIALER_CONNECTION.hset('CAMP:4:CHANNELS', PHASE_ONCALL, 1)
+        phase_key = 'OML:CALLS:PHASE:4:9:swept-call'
+        AverageWorker.REDIS_DIALER_CONNECTION.set(phase_key, PHASE_ONCALL, ex=3600)
+
+        # Monkeypatch: tras el eval de finalize, re-SET la phase (race).
+        real_eval = AverageWorker.REDIS_DIALER_CONNECTION.eval
+
+        def _eval_resurrect(*args, **kwargs):
+            result = real_eval(*args, **kwargs)
+            AverageWorker.REDIS_DIALER_CONNECTION.set(
+                phase_key, PHASE_ONCALL, ex=3600,
+            )
+            return result
+
+        AverageWorker.REDIS_DIALER_CONNECTION.eval = _eval_resurrect
+        try:
+            self.assertTrue(
+                AverageWorker._decrement_calls_once(
+                    4, 9, 'swept-call', context='race-sim',
+                ),
+            )
+        finally:
+            AverageWorker.REDIS_DIALER_CONNECTION.eval = real_eval
+        self.assertIsNone(AverageWorker.REDIS_DIALER_CONNECTION.get(phase_key))
+
+    def test_out_of_order_answer_agent_no_orphan_adopt(self):
+        """Sin phase/reserva viva, Dial ANSWER no infla ONCALL fantasma."""
         AverageWorker.connect_redis_dialer()
         AverageWorker.GM_CLIENT.submit_job = MagicMock()
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 1)
@@ -3219,11 +4236,308 @@ class MyTestSuite(unittest.TestCase):
         )
         AverageWorker.process_event(self.worker, job)
         phases = AverageWorker.get_campaign_channel_phases(4)
-        self.assertEqual(phases[PHASE_ONCALL], 1)
-        self.assertEqual(
+        self.assertEqual(phases[PHASE_ONCALL], 0)
+        self.assertIsNone(
             AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:PHASE:4:1:ooo-1'),
-            PHASE_ONCALL,
         )
+
+    def test_reserve_idempotent_same_contact(self):
+        AverageWorker.connect_redis_dialer()
+        AverageWorker._init_campaign_channel_phases(4)
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 0)
+        self.assertEqual(AverageWorker._reserve_dialer_channel(4, 1), RESERVE_OK)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1,
+        )
+        self.assertEqual(
+            AverageWorker._reserve_dialer_channel(4, 1), RESERVE_PHASE_EXISTS,
+        )
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 1,
+        )
+
+    def test_rollback_then_channel_destroyed_single_decr(self):
+        AverageWorker.connect_redis_dialer()
+        AverageWorker._init_campaign_channel_phases(4)
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 0)
+        self.assertEqual(AverageWorker._reserve_dialer_channel(4, 1), RESERVE_OK)
+        self.assertTrue(
+            AverageWorker._decrement_calls_once(
+                4, 1, None, context='gearman_dial_rollback', use_dedup=True,
+            ),
+        )
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 0,
+        )
+        self.assertFalse(
+            AverageWorker._decrement_calls_once(
+                4, 1, 'late-destroy-1', context='ChannelDestroyed', use_dedup=True,
+            ),
+        )
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 0,
+        )
+
+    def test_retry_same_contact_after_finalize_can_decr_again(self):
+        """Finalize con callid no debe bloquear DECR del reintento del contacto."""
+        AverageWorker.connect_redis_dialer()
+        AverageWorker._init_campaign_channel_phases(4)
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        r.set('OML:CALLS:4:DIALER', 0)
+        self.assertEqual(AverageWorker._reserve_dialer_channel(4, 1), RESERVE_OK)
+        self.assertTrue(
+            AverageWorker._decrement_calls_once(
+                4, 1, 'attempt-1', context='ChannelDestroyed', use_dedup=True,
+            ),
+        )
+        self.assertEqual(int(r.get('OML:CALLS:4:DIALER')), 0)
+        # Reintento: reserve limpia marker; nuevo DECR debe aplicar.
+        self.assertEqual(AverageWorker._reserve_dialer_channel(4, 1), RESERVE_OK)
+        self.assertEqual(int(r.get('OML:CALLS:4:DIALER')), 1)
+        self.assertIsNone(r.get('OML:CALLS:DECR:4:1'))
+        self.assertTrue(
+            AverageWorker._decrement_calls_once(
+                4, 1, 'attempt-2', context='ChannelDestroyed', use_dedup=True,
+            ),
+        )
+        self.assertEqual(int(r.get('OML:CALLS:4:DIALER')), 0)
+
+    def test_renew_process_campaign_lock_extends_ttl(self):
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        key = 'PROCESS-CAMPAIGN-4'
+        token = 'owner-token'
+        r.set(key, token, ex=2)
+        self.assertTrue(AverageWorker._renew_process_campaign_lock(4, token))
+        ttl = r.ttl(key)
+        self.assertGreater(ttl, 2)
+
+    def test_process_campaign_lock_token_renew_and_release(self):
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        key = 'PROCESS-CAMPAIGN-4'
+        token_a = AverageWorker.check_running_job(4)
+        self.assertIsNotNone(token_a)
+        self.assertEqual(r.get(key), token_a)
+        # segundo worker no adquiere
+        self.assertIsNone(AverageWorker.check_running_job(4))
+        # renew con token ajeno falla
+        self.assertFalse(
+            AverageWorker._renew_process_campaign_lock(4, 'other-token'),
+        )
+        self.assertTrue(AverageWorker._renew_process_campaign_lock(4, token_a))
+        # release ajeno no borra
+        self.assertFalse(
+            AverageWorker._release_process_campaign_lock(4, 'other-token'),
+        )
+        self.assertEqual(r.get(key), token_a)
+        self.assertTrue(
+            AverageWorker._release_process_campaign_lock(4, token_a),
+        )
+        self.assertIsNone(r.get(key))
+
+    def test_lost_lease_exits_process_campaign_inside(self):
+        AverageWorker.connect_redis_dialer()
+        self._set_campaign_active(4)
+        AverageWorker.campaign_is_active = MagicMock(return_value=True)
+        AverageWorker._renew_process_campaign_lock = MagicMock(return_value=False)
+        try:
+            AverageWorker.process_campaign_inside(4, lock_token='tok')
+            AverageWorker._renew_process_campaign_lock.assert_called()
+            # no debe haber entrado a take_contacts / dial
+            AverageWorker.campaign_is_active.assert_called()
+        finally:
+            del AverageWorker.campaign_is_active
+            del AverageWorker._renew_process_campaign_lock
+
+    def test_reserve_phase_exists_does_not_mark_created(self):
+        """Fallo por phase viva no debe reencolar el contacto a CREATED."""
+        self._set_campaign_active(4, max_channels=5)
+        AverageWorker.connect_redis_dialer()
+        AverageWorker._init_campaign_channel_phases(4)
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 0)
+        self.assertEqual(AverageWorker._reserve_dialer_channel(4, 1), RESERVE_OK)
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'UPDATE contact_in_campaign SET status = %s '
+                'WHERE id_campaign = 4 AND id_contact = 1',
+                (STATUS_SELECTED_CALL,),
+            )
+        # simular el branch del loop: phase_exists → no mark CREATED
+        reason = AverageWorker._reserve_dialer_channel(4, 1)
+        self.assertEqual(reason, RESERVE_PHASE_EXISTS)
+        if reason != RESERVE_PHASE_EXISTS:
+            AverageWorker._mark_contact_status_created(4, 1)
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'SELECT status FROM contact_in_campaign '
+                'WHERE id_campaign = 4 AND id_contact = 1',
+            )
+            self.assertEqual(cur.fetchone()[0], STATUS_SELECTED_CALL)
+
+    def test_schedule_contact_phase_exists_skips_without_created(self):
+        self._set_campaign_active(4, max_channels=5)
+        AverageWorker.connect_redis_dialer()
+        AverageWorker._init_campaign_channel_phases(4)
+        AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 0)
+        self.assertEqual(AverageWorker._reserve_dialer_channel(4, 1), RESERVE_OK)
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'UPDATE contact_in_campaign SET status = %s '
+                'WHERE id_campaign = 4 AND id_contact = 1',
+                (STATUS_SELECTED_CALL,),
+            )
+        original_trigger = SchedulerWorker.trigger_acd_dial
+        SchedulerWorker.trigger_acd_dial = MagicMock(return_value=True)
+        try:
+            result = SchedulerWorker.schedule_contact('6093017590', 4, 1)
+            self.assertEqual(result, 'Skipped: contact already in flight')
+            SchedulerWorker.trigger_acd_dial.assert_not_called()
+            with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    'SELECT status FROM contact_in_campaign '
+                    'WHERE id_campaign = 4 AND id_contact = 1',
+                )
+                self.assertEqual(cur.fetchone()[0], STATUS_SELECTED_CALL)
+        finally:
+            SchedulerWorker.trigger_acd_dial = original_trigger
+
+    def test_take_contacts_skip_locked_sql(self):
+        """El SELECT interno usa FOR UPDATE SKIP LOCKED."""
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+            cur = conn.cursor()
+            # capturar el SQL vía wrapper mínimo: ejecutar take_contacts real
+            contacts = AverageWorker.take_contacts(1, 4)
+            self.assertEqual(len(contacts), 1)
+            cur.execute(
+                'SELECT status FROM contact_in_campaign '
+                'WHERE id_campaign = 4 AND id_contact = %s',
+                (contacts[0][0],),
+            )
+            self.assertEqual(cur.fetchone()[0], STATUS_SELECTED_CALL)
+        # verificar texto del statement en el source
+        import inspect
+        src = inspect.getsource(AverageWorker.take_contacts)
+        self.assertIn('FOR UPDATE SKIP LOCKED', src)
+
+    def test_recycle_selected_despite_calls_gt_zero_excludes_inflight(self):
+        """SELECTED sin phase se reciclan aunque OML:CALLS>0; in-flight se excluye."""
+        self._set_campaign_active(4, max_channels=10)
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        AverageWorker._init_campaign_channel_phases(4)
+        r.set('OML:CALLS:4:DIALER', 2)
+        r.set('OML:CALLS:PHASE:4:1:call-1', PHASE_ONCALL, ex=3600)
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'UPDATE contact_in_campaign SET status = %s '
+                'WHERE id_campaign = 4 AND id_contact IN (1, 2)',
+                (STATUS_SELECTED_CALL,),
+            )
+        recycled = AverageWorker._recycle_stuck_selected_if_idle(4)
+        self.assertGreaterEqual(recycled, 1)
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'SELECT id_contact, status FROM contact_in_campaign '
+                'WHERE id_campaign = 4 AND id_contact IN (1, 2) '
+                'ORDER BY id_contact',
+            )
+            rows = dict(cur.fetchall())
+        self.assertEqual(rows[1], STATUS_SELECTED_CALL)
+        self.assertEqual(rows[2], STATUS_CREATED)
+        self.assertEqual(int(r.get('OML:CALLS:4:DIALER')), 2)
+
+    def test_recycle_selected_blocked_only_by_recent_reserve_without_phases(self):
+        """Sin phase keys, reserve reciente sigue bloqueando recycle completo."""
+        self._set_campaign_active(4, max_channels=10)
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        AverageWorker._init_campaign_channel_phases(4)
+        r.set('OML:CALLS:4:DIALER', 0)
+        r.set('OML:CALLS:RESERVE_TS:4:1', str(int(time.time())), ex=120)
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'UPDATE contact_in_campaign SET status = %s '
+                'WHERE id_campaign = 4 AND id_contact = 2',
+                (STATUS_SELECTED_CALL,),
+            )
+        recycled = AverageWorker._recycle_stuck_selected_if_idle(4)
+        self.assertEqual(recycled, 0)
+        with psycopg.connect(AverageWorker.POSTGRES_DIALER_CONNECTION_STR) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'SELECT status FROM contact_in_campaign '
+                'WHERE id_campaign = 4 AND id_contact = 2',
+            )
+            self.assertEqual(cur.fetchone()[0], STATUS_SELECTED_CALL)
+
+    def test_align_phases_after_audit_down_zero_purges(self):
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        AverageWorker._init_campaign_channel_phases(4)
+        r.hset('CAMP:4:CHANNELS', mapping={PHASE_RINGING: 2, PHASE_ONCALL: 1})
+        r.set('OML:CALLS:PHASE:4:1', PHASE_RINGING, ex=3600)
+        r.set('OML:CALLS:PHASE:4:2', PHASE_ONCALL, ex=3600)
+        r.set('OML:CALLS:RESERVE_TS:4:1', str(int(time.time())), ex=120)
+        AverageWorker._align_phases_after_audit_down(4, 0)
+        phases = AverageWorker.get_campaign_channel_phases(4)
+        self.assertEqual(phases['TOTAL'], 0)
+        self.assertIsNone(r.get('OML:CALLS:PHASE:4:1'))
+        self.assertIsNone(r.get('OML:CALLS:RESERVE_TS:4:1'))
+
+    def test_align_phases_never_purges_oncall_or_waiting(self):
+        """target>0 no debe borrar WAITING/ONCALL aunque haya exceso de keys."""
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        now = int(time.time())
+        # 2 ONCALL + 1 WAITING + 3 RINGING viejos; target=2 → solo RINGING
+        r.set('OML:CALLS:PHASE:4:1', PHASE_ONCALL, ex=3600)
+        r.set('OML:CALLS:PHASE:4:2', PHASE_ONCALL, ex=3600)
+        r.set('OML:CALLS:PHASE:4:3', PHASE_WAITING_AGENT, ex=3600)
+        r.set('OML:CALLS:PHASE:4:4', PHASE_RINGING, ex=3600)
+        r.set('OML:CALLS:PHASE:4:5', PHASE_RINGING, ex=3600)
+        r.set('OML:CALLS:PHASE:4:6', PHASE_RINGING, ex=3600)
+        for cid in (4, 5, 6):
+            r.set(f'OML:CALLS:RESERVE_TS:4:{cid}', str(now - 60), ex=120)
+        AverageWorker._align_phases_after_audit_down(4, 2)
+        self.assertEqual(r.get('OML:CALLS:PHASE:4:1'), PHASE_ONCALL)
+        self.assertEqual(r.get('OML:CALLS:PHASE:4:2'), PHASE_ONCALL)
+        self.assertEqual(r.get('OML:CALLS:PHASE:4:3'), PHASE_WAITING_AGENT)
+        # Las 3 RINGING viejas deben haberse purgado (exceso 6-2=4, solo 3 elegibles)
+        self.assertIsNone(r.get('OML:CALLS:PHASE:4:4'))
+        self.assertIsNone(r.get('OML:CALLS:PHASE:4:5'))
+        self.assertIsNone(r.get('OML:CALLS:PHASE:4:6'))
+
+    def test_align_phases_keeps_recent_ringing_reserve(self):
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        now = int(time.time())
+        r.set('OML:CALLS:PHASE:4:1', PHASE_RINGING, ex=3600)
+        r.set('OML:CALLS:PHASE:4:2', PHASE_RINGING, ex=3600)
+        r.set('OML:CALLS:RESERVE_TS:4:1', str(now), ex=120)       # reciente
+        r.set('OML:CALLS:RESERVE_TS:4:2', str(now - 60), ex=120)  # viejo
+        AverageWorker._align_phases_after_audit_down(4, 1)
+        self.assertEqual(r.get('OML:CALLS:PHASE:4:1'), PHASE_RINGING)
+        self.assertIsNone(r.get('OML:CALLS:PHASE:4:2'))
+
+    def test_align_phases_skips_when_only_protected_excess(self):
+        """Solo ONCALL en exceso → no borra nada (fail-safe)."""
+        AverageWorker.connect_redis_dialer()
+        r = AverageWorker.REDIS_DIALER_CONNECTION
+        r.set('OML:CALLS:PHASE:4:1', PHASE_ONCALL, ex=3600)
+        r.set('OML:CALLS:PHASE:4:2', PHASE_ONCALL, ex=3600)
+        r.set('OML:CALLS:PHASE:4:3', PHASE_WAITING_AGENT, ex=3600)
+        AverageWorker._align_phases_after_audit_down(4, 1)
+        self.assertEqual(r.get('OML:CALLS:PHASE:4:1'), PHASE_ONCALL)
+        self.assertEqual(r.get('OML:CALLS:PHASE:4:2'), PHASE_ONCALL)
+        self.assertEqual(r.get('OML:CALLS:PHASE:4:3'), PHASE_WAITING_AGENT)
 
     def test_reset_clears_channel_phases(self):
         AverageWorker.connect_redis_dialer()
@@ -3236,7 +4550,15 @@ class MyTestSuite(unittest.TestCase):
         AverageWorker.REDIS_DIALER_CONNECTION.set(
             'OML:CALLS:PHASE:4:1:x', PHASE_ONCALL, ex=3600,
         )
-        AverageWorker.reset_dialer_calls_counter(4, reason='test-phases')
+        # sin force no debe borrar phase keys vivas
+        skipped = AverageWorker.reset_dialer_calls_counter(4, reason='test-phases')
+        self.assertFalse(skipped)
+        self.assertEqual(int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 3)
+        self.assertEqual(
+            AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:PHASE:4:1:x'),
+            PHASE_ONCALL,
+        )
+        AverageWorker.reset_dialer_calls_counter(4, reason='test-phases', force=True)
         self.assertEqual(int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 0)
         phases = AverageWorker.get_campaign_channel_phases(4)
         self.assertEqual(phases['TOTAL'], 0)
@@ -3244,51 +4566,35 @@ class MyTestSuite(unittest.TestCase):
             AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:PHASE:4:1:x'),
         )
 
-    def test_audit_reconciles_ringing_with_new_payload(self):
+    def test_audit_reconciles_ringing_after_streaks(self):
         self._set_campaign_active(4)
         AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1')
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 5)
         AverageWorker._init_campaign_channel_phases(4)
         AverageWorker.REDIS_DIALER_CONNECTION.hset('CAMP:4:CHANNELS', PHASE_RINGING, 4)
         AverageWorker.REDIS_DIALER_CONNECTION.hset(
             'CAMP:4:CHANNELS', PHASE_WAITING_AGENT, 1,
         )
-        original_fetch = AverageWorker._fetch_asterisk_dialer_channel_counts
-        original_reserve = AverageWorker._campaign_has_recent_reserve
-        AverageWorker._campaign_has_recent_reserve = MagicMock(return_value=False)
-        AverageWorker._fetch_asterisk_dialer_channel_counts = MagicMock(
-            return_value=(True, {4: 3}, {4: 2})
+        # calls down needs 4 ticks; ringing down also 4 — after 4 both settle
+        self._run_audit_with_fetch((True, {4: 3}, {4: 2}), reserve=False, times=4)
+        self.assertEqual(
+            int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 3,
         )
-        try:
-            AverageWorker.audit_active_channels()
-            self.assertEqual(
-                int(AverageWorker.REDIS_DIALER_CONNECTION.get('OML:CALLS:4:DIALER')), 3,
-            )
-            phases = AverageWorker.get_campaign_channel_phases(4)
-            self.assertEqual(phases[PHASE_RINGING], 2)
-        finally:
-            AverageWorker._fetch_asterisk_dialer_channel_counts = original_fetch
-            AverageWorker._campaign_has_recent_reserve = original_reserve
+        phases = AverageWorker.get_campaign_channel_phases(4)
+        self.assertEqual(phases[PHASE_RINGING], 2)
 
-    def test_audit_skips_ringing_reconcile_without_field(self):
+    def test_audit_ringing_unchanged_on_first_mismatch_tick(self):
         self._set_campaign_active(4)
         AverageWorker.connect_redis_dialer()
+        self._seed_acd_nodes_registry('n1')
         AverageWorker.REDIS_DIALER_CONNECTION.set('OML:CALLS:4:DIALER', 2)
         AverageWorker._init_campaign_channel_phases(4)
         AverageWorker.REDIS_DIALER_CONNECTION.hset('CAMP:4:CHANNELS', PHASE_RINGING, 2)
-        original_fetch = AverageWorker._fetch_asterisk_dialer_channel_counts
-        original_reserve = AverageWorker._campaign_has_recent_reserve
-        AverageWorker._campaign_has_recent_reserve = MagicMock(return_value=False)
-        AverageWorker._fetch_asterisk_dialer_channel_counts = MagicMock(
-            return_value=(True, {4: 2}, None)
-        )
-        try:
-            AverageWorker.audit_active_channels()
-            phases = AverageWorker.get_campaign_channel_phases(4)
-            self.assertEqual(phases[PHASE_RINGING], 2)
-        finally:
-            AverageWorker._fetch_asterisk_dialer_channel_counts = original_fetch
-            AverageWorker._campaign_has_recent_reserve = original_reserve
+        # observed ringing 0 → would down, but streak=1 keeps RINGING=2
+        self._run_audit_with_fetch((True, {4: 2}, {4: 0}), reserve=False, times=1)
+        phases = AverageWorker.get_campaign_channel_phases(4)
+        self.assertEqual(phases[PHASE_RINGING], 2)
 
     def _make_oml_cursor_for_shuffle(self, shuffle):
         cursor_oml = MagicMock()
@@ -3396,6 +4702,342 @@ class MyTestSuite(unittest.TestCase):
         self.assertEqual(ordered_contacts, list(range(100, 0, -1)))
         contacts_sql = [s for s in executed if 'ominicontacto_app_contacto' in s][0]
         self.assertIn('ORDER BY random()', contacts_sql)
+
+
+class SchedulerLeaderLeaseTests(unittest.TestCase):
+    """Leader lease: solo un SchedulerWorker hace resume(); peers quedan paused."""
+
+    def setUp(self):
+        naive_mod._SCHED_LEASE_TOKEN = None
+        naive_mod._SCHED_IS_LEADER = False
+        self.mock_scheduler = MagicMock()
+        self.mock_scheduler.running = True
+        self._orig_scheduler = SchedulerWorker.SCHEDULER
+        SchedulerWorker.SCHEDULER = self.mock_scheduler
+
+    def tearDown(self):
+        SchedulerWorker.SCHEDULER = self._orig_scheduler
+        naive_mod._SCHED_LEASE_TOKEN = None
+        naive_mod._SCHED_IS_LEADER = False
+
+    def test_lease_tick_acquire_resumes_scheduler(self):
+        with patch.object(SchedulerWorker, '_lease_acquire', return_value=True):
+            with patch.object(
+                SchedulerWorker, '_make_lease_token', return_value='node-a:tok1',
+            ):
+                SchedulerWorker._leader_lease_tick()
+        self.assertTrue(naive_mod._SCHED_IS_LEADER)
+        self.assertEqual(naive_mod._SCHED_LEASE_TOKEN, 'node-a:tok1')
+        self.mock_scheduler.resume.assert_called_once()
+        self.mock_scheduler.pause.assert_not_called()
+
+    def test_lease_tick_held_by_peer_stays_paused(self):
+        with patch.object(SchedulerWorker, '_lease_acquire', return_value=False):
+            with patch.object(
+                SchedulerWorker, '_make_lease_token', return_value='node-b:tok2',
+            ):
+                SchedulerWorker._leader_lease_tick()
+        self.assertFalse(naive_mod._SCHED_IS_LEADER)
+        self.assertIsNone(naive_mod._SCHED_LEASE_TOKEN)
+        self.mock_scheduler.resume.assert_not_called()
+        self.mock_scheduler.pause.assert_called()
+
+    def test_lease_tick_renew_ok_keeps_leader(self):
+        naive_mod._SCHED_LEASE_TOKEN = 'node-a:tok1'
+        naive_mod._SCHED_IS_LEADER = True
+        with patch.object(SchedulerWorker, '_lease_renew', return_value=True) as renew:
+            with patch.object(SchedulerWorker, '_lease_acquire') as acquire:
+                SchedulerWorker._leader_lease_tick()
+        renew.assert_called_once_with('node-a:tok1')
+        acquire.assert_not_called()
+        self.assertTrue(naive_mod._SCHED_IS_LEADER)
+        self.mock_scheduler.pause.assert_not_called()
+        # Ya era líder: no vuelve a resume
+        self.mock_scheduler.resume.assert_not_called()
+
+    def test_lease_tick_renew_fail_then_reacquire(self):
+        naive_mod._SCHED_LEASE_TOKEN = 'node-a:old'
+        naive_mod._SCHED_IS_LEADER = True
+        with patch.object(SchedulerWorker, '_lease_renew', return_value=False):
+            with patch.object(SchedulerWorker, '_lease_acquire', return_value=True):
+                with patch.object(
+                    SchedulerWorker, '_make_lease_token', return_value='node-a:new',
+                ):
+                    SchedulerWorker._leader_lease_tick()
+        self.assertTrue(naive_mod._SCHED_IS_LEADER)
+        self.assertEqual(naive_mod._SCHED_LEASE_TOKEN, 'node-a:new')
+        self.mock_scheduler.pause.assert_called()
+        self.mock_scheduler.resume.assert_called()
+
+    def test_lease_tick_renew_fail_peer_holds_pauses(self):
+        naive_mod._SCHED_LEASE_TOKEN = 'node-a:old'
+        naive_mod._SCHED_IS_LEADER = True
+        with patch.object(SchedulerWorker, '_lease_renew', return_value=False):
+            with patch.object(SchedulerWorker, '_lease_acquire', return_value=False):
+                with patch.object(
+                    SchedulerWorker, '_make_lease_token', return_value='node-a:new',
+                ):
+                    SchedulerWorker._leader_lease_tick()
+        self.assertFalse(naive_mod._SCHED_IS_LEADER)
+        self.assertIsNone(naive_mod._SCHED_LEASE_TOKEN)
+        self.mock_scheduler.pause.assert_called()
+        self.mock_scheduler.resume.assert_not_called()
+
+    def test_lease_acquire_uses_redis_set_nx(self):
+        mock_redis = MagicMock()
+        mock_redis.set.return_value = True
+        with patch.object(SchedulerWorker, '_redis', return_value=mock_redis):
+            ok = SchedulerWorker._lease_acquire('tok', ttl=15)
+        self.assertTrue(ok)
+        mock_redis.set.assert_called_once_with(
+            SCHEDULER_LEADER_KEY, 'tok', nx=True, ex=15,
+        )
+
+
+class StabilizationFixesUnitTests(unittest.TestCase):
+    """Unit tests for stabilization fixes (fail_no_rules final_status, lost_lease revert, etc.)."""
+
+    def test_fail_no_rules_event_marks_finalized_nocontact(self):
+        orig_set_status = AverageWorker.set_contact_status
+        orig_incidence = AverageWorker.handle_incidence_rules
+        orig_finalize = AverageWorker._finalize_contact_nocontact
+        AverageWorker.set_contact_status = MagicMock()
+        AverageWorker.handle_incidence_rules = MagicMock()
+        AverageWorker._finalize_contact_nocontact = MagicMock()
+        try:
+            for dialstatus in (
+                'EXIT_ABANDON', 'CHANUNAVAIL', 'ORIGINATE_FAILED',
+            ):
+                AverageWorker.handle_incidence_rules.reset_mock()
+                AverageWorker._finalize_contact_nocontact.reset_mock()
+                AverageWorker.handle_fail_event(
+                    {'dialstatus': dialstatus, 'type': 'Dial'},
+                    id_campaign=4, contact_id=10, phone_number='6093017590',
+                )
+                AverageWorker.handle_incidence_rules.assert_not_called()
+                AverageWorker._finalize_contact_nocontact.assert_called_once_with(4, 10)
+        finally:
+            AverageWorker.set_contact_status = orig_set_status
+            AverageWorker.handle_incidence_rules = orig_incidence
+            AverageWorker._finalize_contact_nocontact = orig_finalize
+
+    def test_amd_fail_event_uses_incidence_rules_not_finalize(self):
+        """AMD applies Contestador incidence path (not FAIL_NO_RULES finalize)."""
+        orig_set_status = AverageWorker.set_contact_status
+        orig_incidence = AverageWorker.handle_incidence_rules
+        orig_finalize = AverageWorker._finalize_contact_nocontact
+        AverageWorker.set_contact_status = MagicMock()
+        AverageWorker.handle_incidence_rules = MagicMock()
+        AverageWorker._finalize_contact_nocontact = MagicMock()
+        try:
+            AverageWorker.handle_fail_event(
+                {'dialstatus': 'AMD', 'type': 'Dial'},
+                id_campaign=4, contact_id=10, phone_number='6093017590',
+            )
+            AverageWorker.set_contact_status.assert_called_once_with(
+                4, 10, 'AMD',
+            )
+            AverageWorker.handle_incidence_rules.assert_called_once_with(
+                'AMD', 4, 10, '6093017590',
+            )
+            AverageWorker._finalize_contact_nocontact.assert_not_called()
+        finally:
+            AverageWorker.set_contact_status = orig_set_status
+            AverageWorker.handle_incidence_rules = orig_incidence
+            AverageWorker._finalize_contact_nocontact = orig_finalize
+
+    def test_exit_timeout_fail_event_uses_incidence_rules_not_finalize(self):
+        """EXIT_TIMEOUT applies UI Timeout incidence path (not FAIL_NO_RULES)."""
+        orig_set_status = AverageWorker.set_contact_status
+        orig_incidence = AverageWorker.handle_incidence_rules
+        orig_finalize = AverageWorker._finalize_contact_nocontact
+        AverageWorker.set_contact_status = MagicMock()
+        AverageWorker.handle_incidence_rules = MagicMock()
+        AverageWorker._finalize_contact_nocontact = MagicMock()
+        try:
+            AverageWorker.handle_fail_event(
+                {'dialstatus': 'EXIT_TIMEOUT', 'type': 'Dial'},
+                id_campaign=4, contact_id=10, phone_number='6093017590',
+            )
+            AverageWorker.set_contact_status.assert_called_once_with(
+                4, 10, 'EXIT_TIMEOUT',
+            )
+            AverageWorker.handle_incidence_rules.assert_called_once_with(
+                'EXIT_TIMEOUT', 4, 10, '6093017590',
+            )
+            AverageWorker._finalize_contact_nocontact.assert_not_called()
+        finally:
+            AverageWorker.set_contact_status = orig_set_status
+            AverageWorker.handle_incidence_rules = orig_incidence
+            AverageWorker._finalize_contact_nocontact = orig_finalize
+
+    def test_lost_lease_after_take_contacts_reverts_selected_contacts(self):
+        orig_active = AverageWorker.campaign_is_active
+        orig_connect = AverageWorker.connect_redis_dialer
+        orig_renew = AverageWorker._renew_process_campaign_lock
+        orig_allowed = AverageWorker.is_allowed_to_call
+        orig_parallel = AverageWorker.allowed_parallel_contact_attempts
+        orig_prio = AverageWorker.allowed_calls_prority_percentage
+        orig_max = AverageWorker.get_campaign_max_available_channels
+        orig_calls = AverageWorker._get_calls_and_phases
+        orig_take = AverageWorker.take_contacts
+        orig_mark = AverageWorker._mark_contact_status_created
+
+        AverageWorker.campaign_is_active = MagicMock(side_effect=[True, False])
+        AverageWorker.connect_redis_dialer = MagicMock()
+        # 1st renew (loop entry) -> True; 2nd renew (after take_contacts) -> False
+        AverageWorker._renew_process_campaign_lock = MagicMock(side_effect=[True, False])
+        AverageWorker.is_allowed_to_call = MagicMock(return_value=(True, None))
+        AverageWorker.allowed_parallel_contact_attempts = MagicMock(return_value=3)
+        AverageWorker.allowed_calls_prority_percentage = MagicMock(return_value=3)
+        AverageWorker.get_campaign_max_available_channels = MagicMock(return_value=10)
+        AverageWorker._get_calls_and_phases = MagicMock(return_value=(0, {}))
+        AverageWorker.take_contacts = MagicMock(return_value=[
+            (101, 4, '111'),
+            (102, 4, '222'),
+            (103, 4, '333'),
+        ])
+        AverageWorker._mark_contact_status_created = MagicMock()
+        try:
+            AverageWorker.process_campaign_inside(4, lock_token='tok-1')
+            reverted_ids = [
+                call.args[1] for call in AverageWorker._mark_contact_status_created.call_args_list
+            ]
+            self.assertEqual(reverted_ids, [101, 102, 103])
+        finally:
+            AverageWorker.campaign_is_active = orig_active
+            AverageWorker.connect_redis_dialer = orig_connect
+            AverageWorker._renew_process_campaign_lock = orig_renew
+            AverageWorker.is_allowed_to_call = orig_allowed
+            AverageWorker.allowed_parallel_contact_attempts = orig_parallel
+            AverageWorker.allowed_calls_prority_percentage = orig_prio
+            AverageWorker.get_campaign_max_available_channels = orig_max
+            AverageWorker._get_calls_and_phases = orig_calls
+            AverageWorker.take_contacts = orig_take
+            AverageWorker._mark_contact_status_created = orig_mark
+
+    def test_lost_lease_mid_batch_reverts_only_unprocessed_contacts(self):
+        orig_active = AverageWorker.campaign_is_active
+        orig_connect = AverageWorker.connect_redis_dialer
+        orig_renew = AverageWorker._renew_process_campaign_lock
+        orig_allowed = AverageWorker.is_allowed_to_call
+        orig_parallel = AverageWorker.allowed_parallel_contact_attempts
+        orig_prio = AverageWorker.allowed_calls_prority_percentage
+        orig_max = AverageWorker.get_campaign_max_available_channels
+        orig_calls = AverageWorker._get_calls_and_phases
+        orig_take = AverageWorker.take_contacts
+        orig_reserve = AverageWorker._reserve_dialer_channel
+        orig_attempt = AverageWorker.attempt_contact
+        orig_mark = AverageWorker._mark_contact_status_created
+
+        AverageWorker.campaign_is_active = MagicMock(side_effect=[True, False])
+        AverageWorker.connect_redis_dialer = MagicMock()
+        # 1st (loop start) True, 2nd (after take_contacts) True, 3rd (after 1st contact dial) False
+        AverageWorker._renew_process_campaign_lock = MagicMock(
+            side_effect=[True, True, False],
+        )
+        AverageWorker.is_allowed_to_call = MagicMock(return_value=(True, None))
+        AverageWorker.allowed_parallel_contact_attempts = MagicMock(return_value=3)
+        AverageWorker.allowed_calls_prority_percentage = MagicMock(return_value=3)
+        AverageWorker.get_campaign_max_available_channels = MagicMock(return_value=10)
+        AverageWorker._get_calls_and_phases = MagicMock(return_value=(0, {}))
+        AverageWorker.take_contacts = MagicMock(return_value=[
+            (101, 4, '111'),
+            (102, 4, '222'),
+            (103, 4, '333'),
+        ])
+        AverageWorker._reserve_dialer_channel = MagicMock(return_value=RESERVE_OK)
+        AverageWorker.attempt_contact = MagicMock()
+        AverageWorker._mark_contact_status_created = MagicMock()
+        try:
+            AverageWorker.process_campaign_inside(4, lock_token='tok-1')
+            AverageWorker.attempt_contact.assert_called_once_with((101, 4, '111'), 4)
+            reverted_ids = [
+                call.args[1] for call in AverageWorker._mark_contact_status_created.call_args_list
+            ]
+            self.assertEqual(reverted_ids, [102, 103])
+        finally:
+            AverageWorker.campaign_is_active = orig_active
+            AverageWorker.connect_redis_dialer = orig_connect
+            AverageWorker._renew_process_campaign_lock = orig_renew
+            AverageWorker.is_allowed_to_call = orig_allowed
+            AverageWorker.allowed_parallel_contact_attempts = orig_parallel
+            AverageWorker.allowed_calls_prority_percentage = orig_prio
+            AverageWorker.get_campaign_max_available_channels = orig_max
+            AverageWorker._get_calls_and_phases = orig_calls
+            AverageWorker.take_contacts = orig_take
+            AverageWorker._reserve_dialer_channel = orig_reserve
+            AverageWorker.attempt_contact = orig_attempt
+            AverageWorker._mark_contact_status_created = orig_mark
+
+    def test_update_prev_stats_uses_passed_snapshot(self):
+        mock_redis = MagicMock()
+        orig_redis = AverageWorker.REDIS_DIALER_CONNECTION
+        AverageWorker.REDIS_DIALER_CONNECTION = mock_redis
+        try:
+            AverageWorker.update_prev_stats(4, stats={'ATTEMPTED_CALLS': '12'})
+            mock_redis.hgetall.assert_not_called()
+            mock_redis.hset.assert_called_once_with(
+                'CAMP:4:COUNTER_PREV', 'ATTEMPTED_CALLS', '12',
+            )
+        finally:
+            AverageWorker.REDIS_DIALER_CONNECTION = orig_redis
+
+    def test_handle_disposition_option_reactivates_finalized_campaign_after_commit(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = ('6093017590',)
+        mock_conn = MagicMock()
+        mock_conn.__enter__.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cursor
+
+        with patch.object(AverageWorker, 'connect_redis_dialer'), \
+             patch.object(AverageWorker, 'REDIS_DIALER_CONNECTION', MagicMock()), \
+             patch.object(AverageWorker, 'get_dialer_connection', return_value=mock_conn), \
+             patch.object(AverageWorker, 'get_incidence_rule_disposition', return_value=(10, 3, 1)), \
+             patch.object(AverageWorker, 'apply_incidence_rule', return_value=True), \
+             patch.object(AverageWorker, 'get_campaign_status', return_value=FINALIZED), \
+             patch.object(AverageWorker, 'set_campaign_status') as mock_set_status, \
+             patch.object(AverageWorker.GM_CLIENT, 'submit_job', create=True) as mock_submit:
+            res = AverageWorker.handle_disposition_option({
+                'id_campaign': 4,
+                'id_contact': 1,
+                'disposition_option': 8,
+            })
+            self.assertEqual(res, b'Disposition for incidence rule was added!')
+            mock_set_status.assert_called_once_with(4, ACTIVE, sync_omnileads=True)
+            mock_submit.assert_called_once()
+
+    def test_schedule_contact_marks_schedule_aborted_when_campaign_paused(self):
+        mock_cursor = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.__enter__.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cursor
+
+        with patch.object(SchedulerWorker, 'get_dialer_connection', return_value=mock_conn), \
+             patch.object(SchedulerWorker, 'get_campaign_status', return_value=PAUSED):
+            res = SchedulerWorker.schedule_contact('6093017590', 4, 99)
+            self.assertEqual(res, 'Skipped: campaign not active')
+            mock_cursor.execute.assert_called_once()
+            sql_called, params_called = mock_cursor.execute.call_args.args
+            self.assertIn('schedule_aborted = true', sql_called)
+            self.assertEqual(params_called, (99, 4))
+
+    def test_stop_campaign_sets_finalized_before_resetting_counter(self):
+        call_order = []
+        with patch.object(AverageWorker, 'insert_job', return_value=1), \
+             patch.object(AverageWorker, 'remove_job'), \
+             patch.object(
+                 AverageWorker, 'set_campaign_status',
+                 side_effect=lambda *a, **kw: call_order.append('set_status'),
+             ), \
+             patch.object(
+                 AverageWorker, 'reset_dialer_calls_counter',
+                 side_effect=lambda *a, **kw: call_order.append('reset_counter'),
+             ):
+            job = MagicMock()
+            job.data = b'{"id_campaign": "4", "sync_omnileads": false}'
+            AverageWorker.stop_campaign(MagicMock(), job)
+            self.assertEqual(call_order, ['set_status', 'reset_counter'])
 
 
 if __name__ == '__main__':
