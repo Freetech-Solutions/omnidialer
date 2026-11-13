@@ -1375,13 +1375,14 @@ class DialModePacingTests(unittest.TestCase):
             'force_throttle': True,
             'event': 'THROTTLE_ENGAGED',
         })
-        # latched throttle → progressive R=1 → target=2, unassigned=2 → 0
+        # latched throttle → progressive con boost=2.0 → target=ceil(2*2)=4,
+        # unassigned(ringing)=2 → C_DIAL=2
         allowed = AverageWorker.allowed_parallel_contact_attempts(self.campaign_id)
-        self.assertEqual(allowed, 0)
+        self.assertEqual(allowed, 2)
         AverageWorker._publish_campaign_pacing.assert_called_once()
         pub_kwargs = AverageWorker._publish_campaign_pacing.call_args.kwargs
         self.assertEqual(pub_kwargs['MODE'], 'PREDICTIVE_THROTTLED')
-        self.assertEqual(pub_kwargs['C_DIAL'], 0)
+        self.assertEqual(pub_kwargs['C_DIAL'], 2)
         self.assertEqual(pub_kwargs['GAMMA'], 0.0)
         self.assertEqual(pub_kwargs['REASON'], 'throttle_streak')
         self.assertEqual(pub_kwargs['DROP_RATE'], 0.05)
@@ -1389,7 +1390,7 @@ class DialModePacingTests(unittest.TestCase):
         self.assertEqual(pub_kwargs['THROTTLE_LATCHED'], 1)
 
     def test_allowed_parallel_predictive_throttled_ready_ignores_oncall(self):
-        """Throttled R=1 still dials for READY when only other agent is ONCALL."""
+        """Throttled con boost de campaña: READY disca aunque otro agente esté ONCALL."""
         self._set_power_keys()
         self._mock_pacing_inputs(
             agents_score=1.0, active=1, max_channels=5, ringing=0, oncall=1)
@@ -1421,11 +1422,52 @@ class DialModePacingTests(unittest.TestCase):
             'force_throttle': True,
             'event': None,
         })
+        # boost=1.5 → target=ceil(1.0*1.5)=2, unassigned=0 → C_DIAL=2
+        allowed = AverageWorker.allowed_parallel_contact_attempts(self.campaign_id)
+        self.assertEqual(allowed, 2)
+        pub_kwargs = AverageWorker._publish_campaign_pacing.call_args.kwargs
+        self.assertEqual(pub_kwargs['MODE'], 'PREDICTIVE_THROTTLED')
+        self.assertEqual(pub_kwargs['C_DIAL'], 2)
+
+    def test_allowed_parallel_predictive_throttled_boost_one_is_r1(self):
+        """Con boost=1.0 el throttle latched equivale a progresivo R=1."""
+        self._set_power_keys()
+        self._mock_pacing_inputs(
+            agents_score=1.0, active=1, max_channels=5, ringing=0, oncall=1)
+        AverageWorker.get_predictive_model = MagicMock(return_value=True)
+        AverageWorker.get_boost_factor = MagicMock(return_value=1.0)
+        AverageWorker.get_campaign_agent_snapshot = MagicMock(return_value={
+            'a_free': 1,
+            'total_ready': 1,
+            'a_oncall': 1.0,
+            'a_postcall': 0.0,
+            'a_pause_acw': 0.0,
+            'a_busy': 1.0,
+            'total_oncall': 1,
+            'total_postcall': 0,
+            'total_pause_acw': 0,
+            'busy_agents': [{'agent_id': 1}],
+        })
+        AverageWorker.get_campaign_att_count = MagicMock(return_value=100)
+        AverageWorker.get_campaign_drop_rate = MagicMock(return_value=0.17)
+        AverageWorker.get_campaign_p_hit = MagicMock(return_value=0.9)
+        AverageWorker.get_campaign_metrics = MagicMock(return_value={})
+        AverageWorker.get_campaign_a_expected = MagicMock(return_value={
+            'a_expected': 0.98, 't_ring': 6.0, 'aht': 50.0, 'att': 30.0, 'acw': 20.0,
+            'details': [],
+        })
+        AverageWorker._update_throttle_streak = MagicMock(return_value={
+            'streak': dialer_settings.THROTTLE_STREAK_K,
+            'latched': True,
+            'force_throttle': True,
+            'event': None,
+        })
         allowed = AverageWorker.allowed_parallel_contact_attempts(self.campaign_id)
         self.assertEqual(allowed, 1)
         pub_kwargs = AverageWorker._publish_campaign_pacing.call_args.kwargs
         self.assertEqual(pub_kwargs['MODE'], 'PREDICTIVE_THROTTLED')
         self.assertEqual(pub_kwargs['C_DIAL'], 1)
+        self.assertEqual(pub_kwargs['REASON'], 'throttle_streak')
 
     def test_allowed_parallel_predictive_soft_hold_when_drop_ge_dmax_no_latch(self):
         """D≥D_max sin latch: soft floor (γ=floor), still predictive C_dial>0."""

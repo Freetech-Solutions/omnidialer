@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 
 MODE_WARMUP = 'warmup'
 MODE_PREDICTIVE = 'predictive'
-MODE_THROTTLED = 'throttled'  # latched kill-switch → progressive R=1
+MODE_THROTTLED = 'throttled'  # latched kill-switch → progressive (campaign boost)
 MODE_PROGRESSIVE_FALLBACK = 'progressive_fallback'
 
 # Soft hold must not overdial above 1× net agent capacity.
@@ -208,7 +208,8 @@ def decide_predictive_pace(
       gamma, c_dial, reason
       use_progressive_r1: bool — caller should dial with progressive boost=1.0
 
-    force_throttle: hard kill-switch (streak ≥ K / latch) → progressive R=1.
+    force_throttle: hard kill-switch (streak ≥ K / latch) → progressive
+    (caller aplica boost de campaña; warmup/sin P_hit siguen R=1).
     Si D ≥ D_max y no force_throttle: soft hold con γ = gamma_floor y ratio ≤ 1×.
     max_dial_ratio: tope global de sobremarcado (≤0 desactiva).
     """

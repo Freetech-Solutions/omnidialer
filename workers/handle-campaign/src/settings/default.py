@@ -65,7 +65,7 @@ MAX_DIAL_RATIO = int(os.getenv('DIALER_MAX_DIAL_RATIO', '5'))
 PACING_SNAPSHOT_TTL_SEC = int(os.getenv('DIALER_PACING_SNAPSHOT_TTL_SEC', '30'))
 # Kill-switch legacy tick count (fallback if STREAK_SEC unset; ticks≈s @ 1s tick)
 THROTTLE_STREAK_K = int(os.getenv('DIALER_THROTTLE_STREAK_K', '5'))
-# Wall-clock seconds with D >= D_max before latching progressive R=1
+# Wall-clock seconds with D >= D_max before latching progressive (campaign boost)
 THROTTLE_STREAK_SEC = int(os.getenv(
     'DIALER_THROTTLE_STREAK_SEC',
     os.getenv('DIALER_THROTTLE_STREAK_K', '5'),

@@ -4578,7 +4578,9 @@ class AverageWorker(DialerWorker):
           γ ≤ 1: floor(((A_free + A_expected - C_ringing * P_hit) / P_hit) * γ)
         luego apply_channel_caps(C_dial, max_channels - active).
 
-        Warm-up / sin P_hit / kill-switch latched (streak ≥ K): progresivo R=1.
+        Warm-up / sin P_hit: progresivo R=1.
+        Kill-switch latched (streak ≥ K): progresivo con boost de campaña
+        (target = READY × initial_boost_factor), no R=1 forzado.
         Aggressiveness = initial_boost_factor (techo de gamma en zona sana).
         """
         snapshot = cls.get_campaign_agent_snapshot(id_campaign)
@@ -4685,11 +4687,18 @@ class AverageWorker(DialerWorker):
         )
 
         if decision['use_progressive_r1']:
+            # throttle_streak: progresivo con boost de campaña (GUI).
+            # warmup / p_hit_unavailable: sigue R=1 estricto.
+            progressive_boost = (
+                aggressiveness
+                if decision.get('reason') == 'throttle_streak'
+                else 1.0
+            )
             logger.debug(
                 "Campaign %s: %s reason=%s a_free=%s a_expected=%s "
                 "ringing=%s p_hit=%s drop_rate=%s d_max=%s gamma=%s "
                 "att_count=%s aggressiveness=%s streak=%s latched=%s; "
-                "progressive R=1",
+                "progressive boost=%s",
                 id_campaign,
                 mode_label,
                 decision['reason'],
@@ -4704,13 +4713,14 @@ class AverageWorker(DialerWorker):
                 aggressiveness,
                 throttle.get('streak'),
                 throttle.get('latched'),
+                progressive_boost,
             )
             c_dial = cls._allowed_parallel_progressive(
                 id_campaign,
                 active_channels,
                 campaign_max_available_channels,
                 num_available_channels,
-                boost_factor=1.0,
+                boost_factor=progressive_boost,
                 mode_label=mode_label,
             )
             cls._publish_campaign_pacing(id_campaign, C_DIAL=c_dial, **pacing_common)
